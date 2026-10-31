@@ -17,11 +17,11 @@ last_signal_candle = {"BTC": None, "GOLD": None}
 
 app = Flask(__name__)
 
-# لوحة أزرار تفاعلية ثابتة تظهر أسفل محادثة تيليجرام
+# لوحة الأزرار المحدثة وتضم زر المضاربة السريعة الرابع
 REPLY_KEYBOARD = {
     "keyboard": [
         [{"text": "🪙 تحليل الذهب فوراً"}, {"text": "₿ تحليل البيتكوين فوراً"}],
-        [{"text": "📊 فحص السوق الشامل"}]
+        [{"text": "⚡ مضاربة سريعة"}, {"text": "📊 فحص السوق الشامل"}]
     ],
     "resize_keyboard": True,
     "is_persistent": True
@@ -43,7 +43,7 @@ def send_msg(text, chat_id=None):
     except Exception as e:
         print(f"Telegram error: {e}")
 
-# ==================== 1. جلب بيانات السوق ====================
+# ==================== 1. جلب بيانات السوق (يدعم 4h, 15m, 5m, 1m) ====================
 def get_btc_ohlcv(timeframe, limit=250):
     for ex_name in ["kucoin", "binance", "kraken"]:
         try:
@@ -67,12 +67,20 @@ def get_gold_ohlcv(timeframe):
             df = raw.resample("4h").agg({
                 "open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"
             }).dropna().reset_index()
-        else:
+        elif timeframe == "15m":
             raw = ticker.history(period="15d", interval="15m").reset_index()
             df = raw.rename(columns={"Datetime": "timestamp", "Date": "timestamp", "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})
+        elif timeframe == "5m":
+            raw = ticker.history(period="5d", interval="5m").reset_index()
+            df = raw.rename(columns={"Datetime": "timestamp", "Date": "timestamp", "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})
+        elif timeframe == "1m":
+            raw = ticker.history(period="5d", interval="1m").reset_index()
+            df = raw.rename(columns={"Datetime": "timestamp", "Date": "timestamp", "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})
+        else:
+            return pd.DataFrame()
         return df[["timestamp", "open", "high", "low", "close", "volume"]]
     except Exception as e:
-        print(f"Gold fetch error: {e}")
+        print(f"Gold fetch error ({timeframe}): {e}")
         return pd.DataFrame()
 
 # ==================== 2. حساب المؤشرات الفنية والـ SMC ====================
@@ -81,6 +89,7 @@ def enrich_indicators(df):
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
+    df["EMA_20"] = df["close"].ewm(span=20, adjust=False).mean()
     df["EMA_50"] = df["close"].ewm(span=50, adjust=False).mean()
     df["EMA_200"] = df["close"].ewm(span=200, adjust=False).mean()
 
@@ -108,6 +117,8 @@ def enrich_indicators(df):
 
     df["swing_low"] = df["low"].rolling(window=10).min().shift(1)
     df["swing_high"] = df["high"].rolling(window=10).max().shift(1)
+    df["micro_low"] = df["low"].rolling(window=5).min().shift(1)
+    df["micro_high"] = df["high"].rolling(window=5).max().shift(1)
     return df
 
 def detect_smc(df):
@@ -129,7 +140,7 @@ def detect_smc(df):
         "p_bear": "سحب سيولة بيعي (Liquidity Sweep)" if bear_sweep else "فجوة سعرية هابطة (FVG)"
     }
 
-# ==================== 3. التحليل الفوري عند الطلب ====================
+# ==================== 3. التحليل الفوري (4H + 15M) ====================
 def instant_analysis(htf_df, ltf_df, asset_name):
     if htf_df.empty or ltf_df.empty or len(htf_df) < 205 or len(ltf_df) < 205:
         return f"⚠️ جاري تحديث بيانات {asset_name}، حاول بعد لحظات."
@@ -177,7 +188,62 @@ def instant_analysis(htf_df, ltf_df, asset_name):
         f"🚀 *الهدف الثاني (TP2):* `{tp2}`"
     )
 
-# ==================== 4. الاستماع لأزرار وأوامر تيليجرام ====================
+# ==================== 4. محرك المضاربة السريعة (Scalping 5M + 1M) ====================
+def scalp_analysis(m5_df, m1_df, asset_name):
+    if m5_df.empty or m1_df.empty or len(m5_df) < 100 or len(m1_df) < 100:
+        return f"⚠️ تعذر جلب بيانات السكالبينج لـ {asset_name} حالياً."
+
+    m5 = enrich_indicators(m5_df)
+    m1 = enrich_indicators(m1_df)
+    c5, c1 = m5.iloc[-1], m1.iloc[-1]
+
+    price = float(c1["close"])
+    atr_1m = max(float(c1["ATR"]), 0.01)
+    rsi_1m = float(c1["RSI"])
+    adx_5m = float(c5["ADX"])
+    m_low = float(c1["micro_low"])
+    m_high = float(c1["micro_high"])
+
+    m5_bull = c5["close"] > c5["EMA_50"]
+    m1_bull = price > c1["EMA_20"]
+    smc_1m = detect_smc(m1)
+
+    # تحديد اتجاه السكالبينج والوقف الضيق
+    if (m5_bull and m1_bull) or (m5_bull and rsi_1m < 45):
+        scalp_dir = "شراء سريع (SCALP LONG) 🟢"
+        reason = smc_1m["p_bull"] if smc_1m["bull"] else "اندفاع شرائي مع تقاطع EMA 20/50"
+        sl = round(min(price - (1.2 * atr_1m), m_low - (0.2 * atr_1m)), 2)
+        risk = min(max(price - sl, 0.8 * atr_1m), 2.0 * atr_1m)
+        sl = round(price - risk, 2)
+        tp1 = round(price + (1.2 * risk), 2)
+        tp2 = round(price + (2.2 * risk), 2)
+    else:
+        scalp_dir = "بيع سريع (SCALP SHORT) 🔴"
+        reason = smc_1m["p_bear"] if smc_1m["bear"] else "ضغط بيعي أسفل EMA 20/50"
+        sl = round(max(price + (1.2 * atr_1m), m_high + (0.2 * atr_1m)), 2)
+        risk = min(max(sl - price, 0.8 * atr_1m), 2.0 * atr_1m)
+        sl = round(price + risk, 2)
+        tp1 = round(price - (1.2 * risk), 2)
+        tp2 = round(price - (2.2 * risk), 2)
+
+    speed_status = "سيولة عالية ممتازة للسكالبينج ⚡" if adx_5m >= 20 else "سيولة هادئة (التزم بالهدف الأول) ⚠️"
+
+    return (
+        f"⚡ *صفقة مضاربة سريعة (5M + 1M): {asset_name}*\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"💵 *السعر اللحظي:* `{round(price, 2)}`\n"
+        f"🧭 *الزخم السريع:* {scalp_dir}\n"
+        f"🧠 *إشارة الدقيقة (1M):* {reason}\n"
+        f"🌊 *حالة السيولة:* {speed_status}\n"
+        f"📈 *مؤشر RSI (1M):* `{round(rsi_1m, 1)}` | *ADX (5M):* `{round(adx_5m, 1)}`\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 *سعر الدخول الفوري:* `{round(price, 2)}`\n"
+        f"🛑 *وقف الخسارة الضيق (SL):* `{sl}`\n"
+        f"✅ *هدف السكالب الأول (TP1):* `{tp1}`\n"
+        f"🚀 *هدف السكالب الثاني (TP2):* `{tp2}`"
+    )
+
+# ==================== 5. الاستماع لأزرار وأوامر تيليجرام ====================
 def telegram_listener():
     offset = None
     while True:
@@ -193,13 +259,17 @@ def telegram_listener():
                         chat_id = str(msg.get("chat", {}).get("id", ""))
 
                         if text in ["/start", "/help"]:
-                            send_msg("🤖 *أهلاً بك!* اضغط على الأزرار بالأسفل للحصول على تحليل وصفقات الذهب والبيتكوين فوراً:", chat_id)
+                            send_msg("🤖 *أهلاً بك!* اختر نوع التحليل المطلوب من الأزرار بالأسفل:", chat_id)
                         elif text in ["/gold", "🪙 تحليل الذهب فوراً"]:
                             send_msg("⏳ *جاري تحليل الذهب XAU/USD...*", chat_id)
                             send_msg(instant_analysis(get_gold_ohlcv(HTF), get_gold_ohlcv(LTF), "XAU/USD (الذهب)"), chat_id)
                         elif text in ["/btc", "₿ تحليل البيتكوين فوراً"]:
                             send_msg("⏳ *جاري تحليل البيتكوين BTC/USDT...*", chat_id)
                             send_msg(instant_analysis(get_btc_ohlcv(HTF), get_btc_ohlcv(LTF), "BTC/USDT (البيتكوين)"), chat_id)
+                        elif text in ["/scalp", "⚡ مضاربة سريعة"]:
+                            send_msg("⚡ *جاري فحص فريم 5 دقائق و1 دقيقة لاقتناص صفقات السكالبينج...*", chat_id)
+                            send_msg(scalp_analysis(get_gold_ohlcv("5m"), get_gold_ohlcv("1m"), "XAU/USD (الذهب)"), chat_id)
+                            send_msg(scalp_analysis(get_btc_ohlcv("5m"), get_btc_ohlcv("1m"), "BTC/USDT (البيتكوين)"), chat_id)
                         elif text in ["/status", "/all", "📊 فحص السوق الشامل"]:
                             send_msg("⏳ *جاري الفحص الشامل للذهب والبيتكوين...*", chat_id)
                             send_msg(instant_analysis(get_gold_ohlcv(HTF), get_gold_ohlcv(LTF), "XAU/USD (الذهب)"), chat_id)
@@ -208,7 +278,7 @@ def telegram_listener():
             print(f"Listener error: {e}")
         time.sleep(2)
 
-# ==================== 5. الرادار التلقائي للصفقات الذهبية ====================
+# ==================== 6. الرادار التلقائي للصفقات الذهبية ====================
 def check_auto_signal(htf_df, ltf_df, asset_name):
     if htf_df.empty or ltf_df.empty or len(htf_df) < 205 or len(ltf_df) < 205:
         return None
@@ -253,11 +323,8 @@ def check_auto_signal(htf_df, ltf_df, asset_name):
 
 def scanner_loop():
     send_msg(
-        "✅ *تم تحديث البوت وتفعيل أزرار التحليل الفوري!*\n"
-        "اضغط على الأزرار أسفل الشاشة أو أرسل:\n"
-        "🔹 /gold لتحليل الذهب فوراً\n"
-        "🔹 /btc لتحليل البيتكوين فوراً\n"
-        "🔹 /status لفحص السوق الشامل"
+        "✅ *تم إضافة زر (⚡ مضاربة سريعة) بنجاح!*\n"
+        "اضغط الآن على زر *⚡ مضاربة سريعة* بالأسفل (أو أرسل /scalp) لتحليل فريم 5 دقائق و1 دقيقة للذهب والبيتكوين."
     )
     while True:
         try:
@@ -286,12 +353,12 @@ def scanner_loop():
 
 @app.route("/")
 def home():
-    return "Pro Trading Bot is Live 24/7!"
+    return "Pro Trading Bot + Scalping is Live 24/7!"
 
 @app.route("/test")
 def test():
-    threading.Thread(target=lambda: send_msg(instant_analysis(get_gold_ohlcv(HTF), get_gold_ohlcv(LTF), "XAU/USD (الذهب)")), daemon=True).start()
-    return "جاري إرسال تحليل الذهب الفوري إلى تيليجرام..."
+    threading.Thread(target=lambda: send_msg(scalp_analysis(get_gold_ohlcv("5m"), get_gold_ohlcv("1m"), "XAU/USD (الذهب)")), daemon=True).start()
+    return "جاري إرسال صفقة المضاربة السريعة للذهب إلى تيليجرام..."
 
 if __name__ == "__main__":
     threading.Thread(target=telegram_listener, daemon=True).start()

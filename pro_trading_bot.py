@@ -7,27 +7,28 @@ import yfinance as yf
 import pandas as pd
 from flask import Flask
 
-# ==================== 1. قراءة مفاتيح تيليجرام تلقائياً ====================
+# ==================== 1. الإعدادات ومفاتيح تيليجرام ====================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 HTF = "4h"                # الفريم الكبير لتحديد الاتجاه العام
 LTF = "15m"               # الفريم الصغير لاقتناص الدخول
-CHECK_INTERVAL = 180      # فحص السوق كل 3 دقائق
+CHECK_INTERVAL = 180      # فحص الصفقات التلقائي كل 3 دقائق
 
 last_signal_candle = {"BTC": None, "GOLD": None}
 
-# ==================== 2. خادم السحابة وفحص الاتصال ====================
+# ==================== 2. خادم السحابة والاتصال بتيليجرام ====================
 app = Flask(__name__)
 
-def send_telegram_msg(text):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return "خطأ: لم يتم إدخال TELEGRAM_BOT_TOKEN أو TELEGRAM_CHAT_ID في إعدادات Render"
+def send_telegram_msg(text, chat_id=None):
+    target_chat = chat_id or TELEGRAM_CHAT_ID
+    if not TELEGRAM_BOT_TOKEN or not target_chat:
+        return "خطأ: المفاتيح غير موجودة"
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
         res = requests.post(
             url,
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"},
+            json={"chat_id": target_chat, "text": text, "parse_mode": "Markdown"},
             timeout=10
         )
         return res.json()
@@ -36,19 +37,15 @@ def send_telegram_msg(text):
 
 @app.route("/")
 def home():
-    token_ok = "✅ موجود" if TELEGRAM_BOT_TOKEN else "❌ مفقود"
-    chat_ok = "✅ موجود" if TELEGRAM_CHAT_ID else "❌ مفقود"
     return (
-        f"<h2>البوت يعمل بنجاح 24/7 (Live)</h2>"
-        f"<p>حالة التوكن (TOKEN): {token_ok}</p>"
-        f"<p>حالة معرف الحساب (CHAT_ID): {chat_ok}</p>"
-        f"<p><a href='/test'>اضغط هنا لإرسال رسالة تجريبية إلى تيليجرام الآن</a></p>"
+        "<h2>البوت التفاعلي يعمل بنجاح 24/7 (Live)</h2>"
+        "<p><a href='/analyze_now'>اضغط هنا لإرسال تحليل السوق الحالي فوراً إلى تيليجرام</a></p>"
     )
 
-@app.route("/test")
-def test_msg():
-    result = send_telegram_msg("🔔 *رسالة تجريبية:* البوت متصل بحسابك في تيليجرام ويعمل بنجاح!")
-    return f"<h3>نتيجة الإرسال إلى تيليجرام:</h3><pre>{result}</pre>"
+@app.route("/analyze_now")
+def analyze_now_web():
+    threading.Thread(target=send_full_report, args=(TELEGRAM_CHAT_ID,), daemon=True).start()
+    return "<h3>✅ جاري تحليل الذهب والبيتكوين وإرسال التقرير إلى تيليجرام خلال ثوانٍ...</h3>"
 
 def run_web_server():
     port = int(os.environ.get("PORT", 10000))
@@ -82,7 +79,7 @@ def get_gold_ohlcv(timeframe):
         df = raw.rename(columns={"Datetime": "timestamp", "Date": "timestamp", "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})
     return df[["timestamp", "open", "high", "low", "close", "volume"]]
 
-# ==================== 4. محرك التحليل العميق المدمج ====================
+# ==================== 4. محرك حساب المؤشرات والـ SMC ====================
 def enrich_indicators(df):
     df = df.copy()
     for col in ["open", "high", "low", "close", "volume"]:
@@ -137,6 +134,106 @@ def detect_smc_patterns(df):
         "pattern_bear": "سحب سيولة بيعي (Liquidity Sweep)" if bearish_sweep else "فجوة سعرية هابطة (FVG)"
     }
 
+# ==================== 5. التحليل الفوري عند الطلب (On-Demand Analysis) ====================
+def generate_instant_analysis(htf_df, ltf_df, asset_name):
+    if htf_df.empty or ltf_df.empty or len(htf_df) < 205 or len(ltf_df) < 205:
+        return f"⚠️ تعذر جلب بيانات كافية لـ {asset_name} حالياً."
+
+    htf = enrich_indicators(htf_df)
+    ltf = enrich_indicators(ltf_df)
+    h_curr = htf.iloc[-1]
+    l_curr = ltf.iloc[-1]
+
+    price = float(l_curr["close"])
+    atr = float(l_curr["ATR"])
+    rsi = float(l_curr["RSI"])
+    adx = float(l_curr["ADX"])
+    swing_low = float(l_curr["swing_low"])
+    swing_high = float(l_curr["swing_high"])
+
+    htf_trend = "صاعد 🟢" if h_curr["close"] > h_curr["EMA_200"] else "هابط 🔴"
+    ltf_trend = "صاعد 🟢" if price > l_curr["EMA_200"] else "هابط 🔴"
+    market_state = "اتجاه قوي 🔥" if adx >= 22 else "تذبذب عرضي (ينصح بالحذر) ⚠️"
+
+    # تحديد خطة التداول المقترحة بناءً على توافق الاتجاه الحالي
+    if price > l_curr["EMA_50"]:
+        bias = "شراء (LONG) 🟢"
+        sl = round(min(price - (1.5 * atr), swing_low - (0.3 * atr)), 2)
+        risk = max(price - sl, 0.5 * atr)
+        tp1 = round(price + (1.5 * risk), 2)
+        tp2 = round(price + (3.0 * risk), 2)
+    else:
+        bias = "بيع (SHORT) 🔴"
+        sl = round(max(price + (1.5 * atr), swing_high + (0.3 * atr)), 2)
+        risk = max(sl - price, 0.5 * atr)
+        tp1 = round(price - (1.5 * risk), 2)
+        tp2 = round(price - (3.0 * risk), 2)
+
+    return (
+        f"📊 *التحليل الفني الفوري: {asset_name}*\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"💵 *السعر الحالي:* `{round(price, 2)}`\n"
+        f"🧭 *الاتجاه العام (4H):* {htf_trend}\n"
+        f"⏱ *الاتجاه اللحظي (15M):* {ltf_trend}\n"
+        f"🌊 *حالة السوق:* {market_state} (`ADX: {round(adx, 1)}`)\n"
+        f"📈 *مؤشر الزخم (RSI):* `{round(rsi, 1)}`\n"
+        f"🧱 *أقرب دعم / مقاومة:* `{round(swing_low, 2)}` | `{round(swing_high, 2)}`\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"💡 *السيناريو الأقرب حالياً:* {bias}\n"
+        f"🎯 *نقطة الارتكاز / الدخول:* `{round(price, 2)}`\n"
+        f"🛑 *الستوب الهيكلي (SL):* `{sl}`\n"
+        f"✅ *الهدف الأول (TP1):* `{tp1}`\n"
+        f"🚀 *الهدف الثاني (TP2):* `{tp2}`"
+    )
+
+def send_full_report(chat_id):
+    send_telegram_msg("⏳ *جاري سحب بيانات السوق الحية وتحليل الذهب والبيتكوين...*", chat_id)
+    btc_report = generate_instant_analysis(get_btc_ohlcv(HTF), get_btc_ohlcv(LTF), "BTC/USDT (البيتكوين)")
+    send_telegram_msg(btc_report, chat_id)
+    gold_report = generate_instant_analysis(get_gold_ohlcv(HTF), get_gold_ohlcv(LTF), "XAU/USD (الذهب)")
+    send_telegram_msg(gold_report, chat_id)
+
+# ==================== 6. الاستماع لأوامرك داخل تيليجرام ====================
+def telegram_command_listener():
+    offset = None
+    while True:
+        try:
+            if TELEGRAM_BOT_TOKEN:
+                url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+                params = {"timeout": 20, "offset": offset}
+                res = requests.get(url, params=params, timeout=25).json()
+                if res.get("ok"):
+                    for item in res.get("result", []):
+                        offset = item["update_id"] + 1
+                        msg = item.get("message", {})
+                        text = msg.get("text", "").strip().lower()
+                        chat_id = str(msg.get("chat", {}).get("id", ""))
+
+                        if text in ["/start", "/help"]:
+                            help_msg = (
+                                "🤖 *أهلاً بك في بوت التحليل المؤسسي!*\n\n"
+                                "يمكنك طلب تحليل السوق في أي لحظة عبر الضغط على أحد الأوامر التالية:\n"
+                                "🔹 /status — تحليل شامل للذهب والبيتكوين معاً\n"
+                                "🔸 /gold — تحليل فوري لـ الذهب XAU/USD\n"
+                                "🔹 /btc — تحليل فوري لـ البيتكوين BTC/USDT\n\n"
+                                "⚡ *ملاحظة:* البوت يراقب السوق تلقائياً في الخلفية ويرسل الصفقات القوية فور اكتمال شروطها."
+                            )
+                            send_telegram_msg(help_msg, chat_id)
+                        elif text in ["/status", "/all"]:
+                            send_full_report(chat_id)
+                        elif text == "/gold":
+                            send_telegram_msg("⏳ *جاري تحليل الذهب XAU/USD...*", chat_id)
+                            rep = generate_instant_analysis(get_gold_ohlcv(HTF), get_gold_ohlcv(LTF), "XAU/USD (الذهب)")
+                            send_telegram_msg(rep, chat_id)
+                        elif text == "/btc":
+                            send_telegram_msg("⏳ *جاري تحليل البيتكوين BTC/USDT...*", chat_id)
+                            rep = generate_instant_analysis(get_btc_ohlcv(HTF), get_btc_ohlcv(LTF), "BTC/USDT (البيتكوين)")
+                            send_telegram_msg(rep, chat_id)
+        except Exception as e:
+            print(f"خطأ في قراءة الأوامر: {e}")
+        time.sleep(2)
+
+# ==================== 7. الفحص التلقائي للصفقات الذهبية ====================
 def evaluate_pro_setup(htf_df, ltf_df, asset_name):
     if htf_df.empty or ltf_df.empty or len(htf_df) < 205 or len(ltf_df) < 205:
         return None
@@ -162,7 +259,7 @@ def evaluate_pro_setup(htf_df, ltf_df, asset_name):
         risk = min(max(price - sl, 0.5 * atr), 1.8 * atr)
         sl = price - risk
         return {
-            "asset": asset_name, "direction": "شراء (LONG) 🟢", "pattern": smc["pattern_bull"],
+            "asset": asset_name, "direction": "شراء مؤكد (LONG) 🟢", "pattern": smc["pattern_bull"],
             "entry": round(price, 2), "sl": round(sl, 2),
             "tp1": round(price + 1.5 * risk, 2), "tp2": round(price + 3.0 * risk, 2),
             "adx": round(adx, 1), "candle_time": str(l_curr["timestamp"])
@@ -173,7 +270,7 @@ def evaluate_pro_setup(htf_df, ltf_df, asset_name):
         risk = min(max(sl - price, 0.5 * atr), 1.8 * atr)
         sl = price + risk
         return {
-            "asset": asset_name, "direction": "بيع (SHORT) 🔴", "pattern": smc["pattern_bear"],
+            "asset": asset_name, "direction": "بيع مؤكد (SHORT) 🔴", "pattern": smc["pattern_bear"],
             "entry": round(price, 2), "sl": round(sl, 2),
             "tp1": round(price - 1.5 * risk, 2), "tp2": round(price - 3.0 * risk, 2),
             "adx": round(adx, 1), "candle_time": str(l_curr["timestamp"])
@@ -182,7 +279,7 @@ def evaluate_pro_setup(htf_df, ltf_df, asset_name):
 
 def format_signal_msg(sig):
     return (
-        f"💎 *إشارة تداول جديدة (MTF + SMC)*\n"
+        f"💎 *إشارة تداول مكتملة الشروط (MTF + SMC)*\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📊 *الأصل:* `{sig['asset']}`\n"
         f"🧭 *الاتجاه:* {sig['direction']}\n"
@@ -195,24 +292,10 @@ def format_signal_msg(sig):
         f"🚀 *الهدف الثاني (TP2):* `{sig['tp2']}`"
     )
 
-# ==================== 5. حلقة التشغيل ====================
 def run_bot():
-    send_telegram_msg("✅ *تم تشغيل بوت الذهب والبيتكوين الاحترافي بنجاح!*\nجاري مراقبة السوق على مدار 24 ساعة وإرسال الصفقات فور اكتمال الشروط.")
-    while True:
-        try:
-            btc_sig = evaluate_pro_setup(get_btc_ohlcv(HTF), get_btc_ohlcv(LTF), "BTC/USDT (البيتكوين)")
-            if btc_sig and last_signal_candle["BTC"] != btc_sig["candle_time"]:
-                send_telegram_msg(format_signal_msg(btc_sig))
-                last_signal_candle["BTC"] = btc_sig["candle_time"]
-
-            gold_sig = evaluate_pro_setup(get_gold_ohlcv(HTF), get_gold_ohlcv(LTF), "XAU/USD (الذهب)")
-            if gold_sig and last_signal_candle["GOLD"] != gold_sig["candle_time"]:
-                send_telegram_msg(format_signal_msg(gold_sig))
-                last_signal_candle["GOLD"] = gold_sig["candle_time"]
-        except Exception as e:
-            print(f"تنبيه أثناء الفحص: {e}")
-        time.sleep(CHECK_INTERVAL)
-
-if __name__ == "__main__":
-    threading.Thread(target=run_web_server, daemon=True).start()
-    run_bot()
+    send_telegram_msg(
+        "✅ *تم تفعيل الأوامر التفاعلية بنجاح!*\n"
+        "أرسل الآن:\n"
+        "👈 /status لتحليل السوق بالكامل فوراً\n"
+        "👈 /gold لتحليل الذهب فوراً\n"
+        "👈 /btc لتحليل البيتكوين فو

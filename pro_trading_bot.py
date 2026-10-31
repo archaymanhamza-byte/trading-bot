@@ -17,26 +17,42 @@ CHECK_INTERVAL = 180      # فحص السوق كل 3 دقائق
 
 last_signal_candle = {"BTC": None, "GOLD": None}
 
-# ==================== 2. خادم السحابة لإبقاء البوت يعمل 24 ساعة ====================
+# ==================== 2. خادم السحابة وفحص الاتصال ====================
 app = Flask(__name__)
+
+def send_telegram_msg(text):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return "خطأ: لم يتم إدخال TELEGRAM_BOT_TOKEN أو TELEGRAM_CHAT_ID في إعدادات Render"
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        res = requests.post(
+            url,
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"},
+            timeout=10
+        )
+        return res.json()
+    except Exception as e:
+        return f"خطأ في الاتصال: {e}"
 
 @app.route("/")
 def home():
-    return "Bot is Active 24/7!"
+    token_ok = "✅ موجود" if TELEGRAM_BOT_TOKEN else "❌ مفقود"
+    chat_ok = "✅ موجود" if TELEGRAM_CHAT_ID else "❌ مفقود"
+    return (
+        f"<h2>البوت يعمل بنجاح 24/7 (Live)</h2>"
+        f"<p>حالة التوكن (TOKEN): {token_ok}</p>"
+        f"<p>حالة معرف الحساب (CHAT_ID): {chat_ok}</p>"
+        f"<p><a href='/test'>اضغط هنا لإرسال رسالة تجريبية إلى تيليجرام الآن</a></p>"
+    )
+
+@app.route("/test")
+def test_msg():
+    result = send_telegram_msg("🔔 *رسالة تجريبية:* البوت متصل بحسابك في تيليجرام ويعمل بنجاح!")
+    return f"<h3>نتيجة الإرسال إلى تيليجرام:</h3><pre>{result}</pre>"
 
 def run_web_server():
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
-
-def send_telegram_msg(text):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("يرجى التأكد من إضافة مفاتيح تيليجرام في إعدادات Render")
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    try:
-        requests.post(url, json={"chat_id": TELEGRAM_BOT_TOKEN, "text": text, "parse_mode": "Markdown"}, timeout=10)
-    except Exception as e:
-        print(f"خطأ في إرسال الرسالة: {e}")
 
 # ==================== 3. جلب بيانات البيتكوين والذهب ====================
 def get_btc_ohlcv(timeframe, limit=250):
@@ -66,31 +82,27 @@ def get_gold_ohlcv(timeframe):
         df = raw.rename(columns={"Datetime": "timestamp", "Date": "timestamp", "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})
     return df[["timestamp", "open", "high", "low", "close", "volume"]]
 
-# ==================== 4. محرك التحليل العميق المدمج (بدون مكتبات خارجية معقدة) ====================
+# ==================== 4. محرك التحليل العميق المدمج ====================
 def enrich_indicators(df):
     df = df.copy()
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # حساب المتوسطات المتحركة الأسية EMA 50 & EMA 200
     df["EMA_50"] = df["close"].ewm(span=50, adjust=False).mean()
     df["EMA_200"] = df["close"].ewm(span=200, adjust=False).mean()
 
-    # حساب مؤشر القوة النسبية RSI 14
     delta = df["close"].diff()
     gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
     loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
     rs = gain / loss.replace(0, 1e-9)
     df["RSI"] = 100 - (100 / (1 + rs))
 
-    # حساب متوسط المدى الحقيقي ATR 14
     high_low = df["high"] - df["low"]
     high_close = (df["high"] - df["close"].shift(1)).abs()
     low_close = (df["low"] - df["close"].shift(1)).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df["ATR"] = tr.ewm(alpha=1/14, adjust=False).mean()
 
-    # حساب مؤشر قوة الاتجاه ADX 14
     up_move = df["high"].diff()
     down_move = -df["low"].diff()
     plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
@@ -101,7 +113,6 @@ def enrich_indicators(df):
     dx = 100 * ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, 1e-9))
     df["ADX"] = dx.ewm(alpha=1/14, adjust=False).mean()
 
-    # حساب القمم والقيعان المحلية
     df["VOL_SMA"] = df["volume"].rolling(window=20).mean()
     df["swing_low"] = df["low"].rolling(window=10).min().shift(1)
     df["swing_high"] = df["high"].rolling(window=10).max().shift(1)

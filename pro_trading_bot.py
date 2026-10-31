@@ -5,7 +5,6 @@ import requests
 import ccxt
 import yfinance as yf
 import pandas as pd
-import pandas_ta as ta
 from flask import Flask
 
 # ==================== 1. قراءة مفاتيح تيليجرام تلقائياً ====================
@@ -15,7 +14,6 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 HTF = "4h"                # الفريم الكبير لتحديد الاتجاه العام
 LTF = "15m"               # الفريم الصغير لاقتناص الدخول
 CHECK_INTERVAL = 180      # فحص السوق كل 3 دقائق
-ACCOUNT_RISK_USD = 20.0   # قيمة المخاطرة بالدولار في كل صفقة
 
 last_signal_candle = {"BTC": None, "GOLD": None}
 
@@ -36,13 +34,12 @@ def send_telegram_msg(text):
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=10)
+        requests.post(url, json={"chat_id": TELEGRAM_BOT_TOKEN, "text": text, "parse_mode": "Markdown"}, timeout=10)
     except Exception as e:
         print(f"خطأ في إرسال الرسالة: {e}")
 
 # ==================== 3. جلب بيانات البيتكوين والذهب ====================
 def get_btc_ohlcv(timeframe, limit=250):
-    """جلب بيانات البيتكوين مع بديل تلقائي لتفادي أي حظر جغرافي"""
     for ex_name in ["kucoin", "binance", "kraken"]:
         try:
             exchange = getattr(ccxt, ex_name)({"enableRateLimit": True})
@@ -56,30 +53,56 @@ def get_btc_ohlcv(timeframe, limit=250):
     return pd.DataFrame()
 
 def get_gold_ohlcv(timeframe):
-    """جلب بيانات الذهب عبر Yahoo Finance"""
     ticker = yf.Ticker("GC=F")
     if timeframe == "4h":
         raw = ticker.history(period="60d", interval="1h").reset_index()
-        raw = raw.rename(columns={"Datetime": "timestamp", "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})
+        raw = raw.rename(columns={"Datetime": "timestamp", "Date": "timestamp", "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})
         raw.set_index("timestamp", inplace=True)
         df = raw.resample("4h").agg({
             "open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"
         }).dropna().reset_index()
     else:
         raw = ticker.history(period="15d", interval="15m").reset_index()
-        df = raw.rename(columns={"Datetime": "timestamp", "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})
+        df = raw.rename(columns={"Datetime": "timestamp", "Date": "timestamp", "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})
     return df[["timestamp", "open", "high", "low", "close", "volume"]]
 
-# ==================== 4. محرك التحليل العميق والأموال الذكية (SMC) ====================
+# ==================== 4. محرك التحليل العميق المدمج (بدون مكتبات خارجية معقدة) ====================
 def enrich_indicators(df):
     df = df.copy()
-    df["EMA_50"] = ta.ema(df["close"], length=50)
-    df["EMA_200"] = ta.ema(df["close"], length=200)
-    df["RSI"] = ta.rsi(df["close"], length=14)
-    df["ATR"] = ta.atr(df["high"], df["low"], df["close"], length=14)
-    df["VOL_SMA"] = ta.sma(df["volume"], length=20)
-    adx_df = ta.adx(df["high"], df["low"], df["close"], length=14)
-    df["ADX"] = adx_df["ADX_14"]
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # حساب المتوسطات المتحركة الأسية EMA 50 & EMA 200
+    df["EMA_50"] = df["close"].ewm(span=50, adjust=False).mean()
+    df["EMA_200"] = df["close"].ewm(span=200, adjust=False).mean()
+
+    # حساب مؤشر القوة النسبية RSI 14
+    delta = df["close"].diff()
+    gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
+    rs = gain / loss.replace(0, 1e-9)
+    df["RSI"] = 100 - (100 / (1 + rs))
+
+    # حساب متوسط المدى الحقيقي ATR 14
+    high_low = df["high"] - df["low"]
+    high_close = (df["high"] - df["close"].shift(1)).abs()
+    low_close = (df["low"] - df["close"].shift(1)).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df["ATR"] = tr.ewm(alpha=1/14, adjust=False).mean()
+
+    # حساب مؤشر قوة الاتجاه ADX 14
+    up_move = df["high"].diff()
+    down_move = -df["low"].diff()
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+    atr_safe = df["ATR"].replace(0, 1e-9)
+    plus_di = 100 * (plus_dm.ewm(alpha=1/14, adjust=False).mean() / atr_safe)
+    minus_di = 100 * (minus_dm.ewm(alpha=1/14, adjust=False).mean() / atr_safe)
+    dx = 100 * ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, 1e-9))
+    df["ADX"] = dx.ewm(alpha=1/14, adjust=False).mean()
+
+    # حساب القمم والقيعان المحلية
+    df["VOL_SMA"] = df["volume"].rolling(window=20).mean()
     df["swing_low"] = df["low"].rolling(window=10).min().shift(1)
     df["swing_high"] = df["high"].rolling(window=10).max().shift(1)
     return df

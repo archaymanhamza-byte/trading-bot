@@ -1,10 +1,14 @@
 import os
+import io
 import time
 import threading
 import requests
 import ccxt
 import yfinance as yf
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 from flask import Flask
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -17,7 +21,6 @@ last_signal_candle = {"BTC": None, "GOLD": None}
 
 app = Flask(__name__)
 
-# لوحة الأزرار المحدثة وتضم زر المضاربة السريعة الرابع
 REPLY_KEYBOARD = {
     "keyboard": [
         [{"text": "🪙 تحليل الذهب فوراً"}, {"text": "₿ تحليل البيتكوين فوراً"}],
@@ -41,9 +44,97 @@ def send_msg(text, chat_id=None):
     try:
         requests.post(url, json=payload, timeout=10)
     except Exception as e:
-        print(f"Telegram error: {e}")
+        print(f"Telegram text error: {e}")
 
-# ==================== 1. جلب بيانات السوق (يدعم 4h, 15m, 5m, 1m) ====================
+def send_photo_msg(photo_buf, caption, chat_id=None):
+    target = chat_id or TELEGRAM_CHAT_ID
+    if not TELEGRAM_BOT_TOKEN or not target:
+        return
+    if photo_buf is None:
+        send_msg(caption, target)
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+    import json
+    data = {
+        "chat_id": target,
+        "caption": caption,
+        "parse_mode": "Markdown",
+        "reply_markup": json.dumps(REPLY_KEYBOARD)
+    }
+    files = {"photo": ("chart.png", photo_buf, "image/png")}
+    try:
+        res = requests.post(url, data=data, files=files, timeout=20)
+        if not res.ok:
+            send_msg(caption, target)
+    except Exception as e:
+        print(f"Telegram photo error: {e}")
+        send_msg(caption, target)
+
+# ==================== 1. رسم الشارت الاحترافي (TradingView Dark Style) ====================
+def generate_chart_image(df, asset_title, entry, sl, tp1, tp2, is_long=True):
+    try:
+        plot_df = df.tail(60).reset_index(drop=True)
+        fig, ax = plt.subplots(figsize=(10, 5.5), dpi=120)
+        fig.patch.set_facecolor("#131722")
+        ax.set_facecolor("#131722")
+
+        # رسم الشموع اليابانية
+        for idx, row in plot_df.iterrows():
+            o, h, l, c = float(row["open"]), float(row["high"]), float(row["low"]), float(row["close"])
+            color = "#26a69a" if c >= o else "#ef5350"
+            ax.plot([idx, idx], [l, h], color=color, linewidth=1.1, zorder=2)
+            body_bottom = min(o, c)
+            body_height = max(abs(c - o), (h - l) * 0.02, 1e-4)
+            ax.bar(idx, body_height, bottom=body_bottom, width=0.62, color=color, edgecolor=color, zorder=3)
+
+        # رسم المتوسطات المتحركة
+        if "EMA_50" in plot_df.columns:
+            ax.plot(plot_df.index, plot_df["EMA_50"], color="#2962ff", linewidth=1.3, label="EMA 50", zorder=4)
+        if "EMA_200" in plot_df.columns:
+            ax.plot(plot_df.index, plot_df["EMA_200"], color="#ff9800", linewidth=1.5, label="EMA 200", zorder=4)
+
+        # رسم خطوط الدخول والستوب والأهداف مع التظليل
+        x_start = len(plot_df) - 18
+        x_end = len(plot_df) + 3
+        ax.set_xlim(-1, x_end + 4)
+
+        ax.axhline(entry, color="#ffffff", linestyle="--", linewidth=1.1, alpha=0.85)
+        ax.axhline(sl, color="#ef5350", linestyle="--", linewidth=1.2, alpha=0.9)
+        ax.axhline(tp1, color="#26a69a", linestyle=":", linewidth=1.2, alpha=0.9)
+        ax.axhline(tp2, color="#00e676", linestyle="--", linewidth=1.3, alpha=0.95)
+
+        ax.fill_between([x_start, x_end], entry, sl, color="#ef5350", alpha=0.14)
+        ax.fill_between([x_start, x_end], entry, tp2, color="#26a69a", alpha=0.14)
+
+        # كتابة الأسعار على يمين الشارت
+        label_x = x_end + 0.3
+        ax.text(label_x, entry, f" ENTRY: {entry}", color="#ffffff", fontsize=8, va="center", fontweight="bold")
+        ax.text(label_x, sl, f" SL: {sl}", color="#ef5350", fontsize=8, va="center", fontweight="bold")
+        ax.text(label_x, tp1, f" TP1: {tp1}", color="#26a69a", fontsize=8, va="center", fontweight="bold")
+        ax.text(label_x, tp2, f" TP2: {tp2}", color="#00e676", fontsize=8, va="center", fontweight="bold")
+
+        direction_txt = "LONG (BUY)" if is_long else "SHORT (SELL)"
+        ax.set_title(f"{asset_title}  |  {direction_txt}  |  Entry: {entry}", color="#ffffff", fontsize=11, fontweight="bold", pad=12)
+
+        ax.grid(color="#2a2e39", linestyle="--", linewidth=0.5, alpha=0.6)
+        ax.tick_params(colors="#b2b5be", labelsize=8)
+        for spine in ax.spines.values():
+            spine.set_color("#2a2e39")
+
+        ax.legend(loc="upper left", facecolor="#1e222d", edgecolor="#2a2e39", labelcolor="#ffffff", fontsize=8)
+        plt.tight_layout()
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png", facecolor=fig.get_facecolor(), edgecolor="none")
+        plt.close(fig)
+        buf.seek(0)
+        return buf
+    except Exception as e:
+        print(f"Chart error: {e}")
+        plt.close("all")
+        return None
+
+# ==================== 2. جلب بيانات السوق ====================
 def get_btc_ohlcv(timeframe, limit=250):
     for ex_name in ["kucoin", "binance", "kraken"]:
         try:
@@ -83,7 +174,7 @@ def get_gold_ohlcv(timeframe):
         print(f"Gold fetch error ({timeframe}): {e}")
         return pd.DataFrame()
 
-# ==================== 2. حساب المؤشرات الفنية والـ SMC ====================
+# ==================== 3. حساب المؤشرات الفنية والـ SMC ====================
 def enrich_indicators(df):
     df = df.copy()
     for col in ["open", "high", "low", "close", "volume"]:
@@ -140,26 +231,28 @@ def detect_smc(df):
         "p_bear": "سحب سيولة بيعي (Liquidity Sweep)" if bear_sweep else "فجوة سعرية هابطة (FVG)"
     }
 
-# ==================== 3. التحليل الفوري (4H + 15M) ====================
-def instant_analysis(htf_df, ltf_df, asset_name):
+# ==================== 4. التحليل الفوري والمضاربة مع توليد الشارت ====================
+def send_instant_with_chart(htf_df, ltf_df, asset_name, chart_code, chat_id=None):
     if htf_df.empty or ltf_df.empty or len(htf_df) < 205 or len(ltf_df) < 205:
-        return f"⚠️ جاري تحديث بيانات {asset_name}، حاول بعد لحظات."
+        send_msg(f"⚠️ جاري تحديث بيانات {asset_name}، حاول بعد لحظات.", chat_id)
+        return
 
     htf = enrich_indicators(htf_df)
     ltf = enrich_indicators(ltf_df)
     h_curr, l_curr = htf.iloc[-1], ltf.iloc[-1]
 
-    price = float(l_curr["close"])
+    price = round(float(l_curr["close"]), 2)
     atr = float(l_curr["ATR"])
-    rsi = float(l_curr["RSI"])
-    adx = float(l_curr["ADX"])
-    s_low = float(l_curr["swing_low"])
-    s_high = float(l_curr["swing_high"])
+    rsi = round(float(l_curr["RSI"]), 1)
+    adx = round(float(l_curr["ADX"]), 1)
+    s_low = round(float(l_curr["swing_low"]), 2)
+    s_high = round(float(l_curr["swing_high"]), 2)
 
     htf_trend = "صاعد 🟢" if h_curr["close"] > h_curr["EMA_200"] else "هابط 🔴"
     ltf_trend = "صاعد 🟢" if price > l_curr["EMA_200"] else "هابط 🔴"
+    is_long = price > l_curr["EMA_50"]
 
-    if price > l_curr["EMA_50"]:
+    if is_long:
         side = "شراء (LONG) 🟢"
         sl = round(min(price - (1.5 * atr), s_low - (0.3 * atr)), 2)
         risk = max(price - sl, 0.5 * atr)
@@ -172,46 +265,48 @@ def instant_analysis(htf_df, ltf_df, asset_name):
         tp1 = round(price - (1.5 * risk), 2)
         tp2 = round(price - (3.0 * risk), 2)
 
-    return (
+    caption = (
         f"📊 *التحليل العميق الفوري: {asset_name}*\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"💵 *السعر الحالي:* `{round(price, 2)}`\n"
+        f"💵 *السعر الحالي:* `{price}`\n"
         f"🧭 *الاتجاه العام (4H):* {htf_trend}\n"
         f"⏱ *الاتجاه اللحظي (15M):* {ltf_trend}\n"
-        f"🔥 *قوة الاتجاه (ADX):* `{round(adx, 1)}` | *RSI:* `{round(rsi, 1)}`\n"
-        f"🧱 *أقرب دعم ومقاومة:* `{round(s_low, 2)}` | `{round(s_high, 2)}`\n"
+        f"🔥 *قوة الاتجاه (ADX):* `{adx}` | *RSI:* `{rsi}`\n"
+        f"🧱 *أقرب دعم ومقاومة:* `{s_low}` | `{s_high}`\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"🎯 *الصفقة المقترحة حالياً:* {side}\n"
-        f"📍 *سعر الدخول:* `{round(price, 2)}`\n"
+        f"📍 *سعر الدخول:* `{price}`\n"
         f"🛑 *وقف الخسارة (SL):* `{sl}`\n"
         f"✅ *الهدف الأول (TP1):* `{tp1}`\n"
         f"🚀 *الهدف الثاني (TP2):* `{tp2}`"
     )
+    chart_buf = generate_chart_image(ltf, f"{chart_code} (15m)", price, sl, tp1, tp2, is_long)
+    send_photo_msg(chart_buf, caption, chat_id)
 
-# ==================== 4. محرك المضاربة السريعة (Scalping 5M + 1M) ====================
-def scalp_analysis(m5_df, m1_df, asset_name):
+def send_scalp_with_chart(m5_df, m1_df, asset_name, chart_code, chat_id=None):
     if m5_df.empty or m1_df.empty or len(m5_df) < 100 or len(m1_df) < 100:
-        return f"⚠️ تعذر جلب بيانات السكالبينج لـ {asset_name} حالياً."
+        send_msg(f"⚠️ تعذر جلب بيانات السكالبينج لـ {asset_name} حالياً.", chat_id)
+        return
 
     m5 = enrich_indicators(m5_df)
     m1 = enrich_indicators(m1_df)
     c5, c1 = m5.iloc[-1], m1.iloc[-1]
 
-    price = float(c1["close"])
+    price = round(float(c1["close"]), 2)
     atr_1m = max(float(c1["ATR"]), 0.01)
-    rsi_1m = float(c1["RSI"])
-    adx_5m = float(c5["ADX"])
+    rsi_1m = round(float(c1["RSI"]), 1)
+    adx_5m = round(float(c5["ADX"]), 1)
     m_low = float(c1["micro_low"])
     m_high = float(c1["micro_high"])
 
     m5_bull = c5["close"] > c5["EMA_50"]
     m1_bull = price > c1["EMA_20"]
     smc_1m = detect_smc(m1)
+    is_long = (m5_bull and m1_bull) or (m5_bull and rsi_1m < 45)
 
-    # تحديد اتجاه السكالبينج والوقف الضيق
-    if (m5_bull and m1_bull) or (m5_bull and rsi_1m < 45):
+    if is_long:
         scalp_dir = "شراء سريع (SCALP LONG) 🟢"
-        reason = smc_1m["p_bull"] if smc_1m["bull"] else "اندفاع شرائي مع تقاطع EMA 20/50"
+        reason = smc_1m["p_bull"] if smc_1m["bull"] else "اندفاع شرائي أعلى EMA 20/50"
         sl = round(min(price - (1.2 * atr_1m), m_low - (0.2 * atr_1m)), 2)
         risk = min(max(price - sl, 0.8 * atr_1m), 2.0 * atr_1m)
         sl = round(price - risk, 2)
@@ -226,22 +321,21 @@ def scalp_analysis(m5_df, m1_df, asset_name):
         tp1 = round(price - (1.2 * risk), 2)
         tp2 = round(price - (2.2 * risk), 2)
 
-    speed_status = "سيولة عالية ممتازة للسكالبينج ⚡" if adx_5m >= 20 else "سيولة هادئة (التزم بالهدف الأول) ⚠️"
-
-    return (
+    caption = (
         f"⚡ *صفقة مضاربة سريعة (5M + 1M): {asset_name}*\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"💵 *السعر اللحظي:* `{round(price, 2)}`\n"
+        f"💵 *السعر اللحظي:* `{price}`\n"
         f"🧭 *الزخم السريع:* {scalp_dir}\n"
         f"🧠 *إشارة الدقيقة (1M):* {reason}\n"
-        f"🌊 *حالة السيولة:* {speed_status}\n"
-        f"📈 *مؤشر RSI (1M):* `{round(rsi_1m, 1)}` | *ADX (5M):* `{round(adx_5m, 1)}`\n"
+        f"📈 *مؤشر RSI (1M):* `{rsi_1m}` | *ADX (5M):* `{adx_5m}`\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"🎯 *سعر الدخول الفوري:* `{round(price, 2)}`\n"
+        f"🎯 *سعر الدخول الفوري:* `{price}`\n"
         f"🛑 *وقف الخسارة الضيق (SL):* `{sl}`\n"
         f"✅ *هدف السكالب الأول (TP1):* `{tp1}`\n"
         f"🚀 *هدف السكالب الثاني (TP2):* `{tp2}`"
     )
+    chart_buf = generate_chart_image(m1, f"{chart_code} Scalp (1m)", price, sl, tp1, tp2, is_long)
+    send_photo_msg(chart_buf, caption, chat_id)
 
 # ==================== 5. الاستماع لأزرار وأوامر تيليجرام ====================
 def telegram_listener():
@@ -259,36 +353,36 @@ def telegram_listener():
                         chat_id = str(msg.get("chat", {}).get("id", ""))
 
                         if text in ["/start", "/help"]:
-                            send_msg("🤖 *أهلاً بك!* اختر نوع التحليل المطلوب من الأزرار بالأسفل:", chat_id)
+                            send_msg("🤖 *أهلاً بك!* اضغط على أي زر بالأسفل ليقوم البوت برسم الشارت وإرسال الصفقة فوراً:", chat_id)
                         elif text in ["/gold", "🪙 تحليل الذهب فوراً"]:
-                            send_msg("⏳ *جاري تحليل الذهب XAU/USD...*", chat_id)
-                            send_msg(instant_analysis(get_gold_ohlcv(HTF), get_gold_ohlcv(LTF), "XAU/USD (الذهب)"), chat_id)
+                            send_msg("⏳ *جاري رسم شارت الذهب وحساب المستويات...*", chat_id)
+                            send_instant_with_chart(get_gold_ohlcv(HTF), get_gold_ohlcv(LTF), "XAU/USD (الذهب)", "XAU/USD", chat_id)
                         elif text in ["/btc", "₿ تحليل البيتكوين فوراً"]:
-                            send_msg("⏳ *جاري تحليل البيتكوين BTC/USDT...*", chat_id)
-                            send_msg(instant_analysis(get_btc_ohlcv(HTF), get_btc_ohlcv(LTF), "BTC/USDT (البيتكوين)"), chat_id)
+                            send_msg("⏳ *جاري رسم شارت البيتكوين وحساب المستويات...*", chat_id)
+                            send_instant_with_chart(get_btc_ohlcv(HTF), get_btc_ohlcv(LTF), "BTC/USDT (البيتكوين)", "BTC/USDT", chat_id)
                         elif text in ["/scalp", "⚡ مضاربة سريعة"]:
-                            send_msg("⚡ *جاري فحص فريم 5 دقائق و1 دقيقة لاقتناص صفقات السكالبينج...*", chat_id)
-                            send_msg(scalp_analysis(get_gold_ohlcv("5m"), get_gold_ohlcv("1m"), "XAU/USD (الذهب)"), chat_id)
-                            send_msg(scalp_analysis(get_btc_ohlcv("5m"), get_btc_ohlcv("1m"), "BTC/USDT (البيتكوين)"), chat_id)
+                            send_msg("⚡ *جاري رسم شارت السكالبينج (5m + 1m) للذهب والبيتكوين...*", chat_id)
+                            send_scalp_with_chart(get_gold_ohlcv("5m"), get_gold_ohlcv("1m"), "XAU/USD (الذهب)", "XAU/USD", chat_id)
+                            send_scalp_with_chart(get_btc_ohlcv("5m"), get_btc_ohlcv("1m"), "BTC/USDT (البيتكوين)", "BTC/USDT", chat_id)
                         elif text in ["/status", "/all", "📊 فحص السوق الشامل"]:
-                            send_msg("⏳ *جاري الفحص الشامل للذهب والبيتكوين...*", chat_id)
-                            send_msg(instant_analysis(get_gold_ohlcv(HTF), get_gold_ohlcv(LTF), "XAU/USD (الذهب)"), chat_id)
-                            send_msg(instant_analysis(get_btc_ohlcv(HTF), get_btc_ohlcv(LTF), "BTC/USDT (البيتكوين)"), chat_id)
+                            send_msg("⏳ *جاري الفحص الشامل ورسم الشارتات...*", chat_id)
+                            send_instant_with_chart(get_gold_ohlcv(HTF), get_gold_ohlcv(LTF), "XAU/USD (الذهب)", "XAU/USD", chat_id)
+                            send_instant_with_chart(get_btc_ohlcv(HTF), get_btc_ohlcv(LTF), "BTC/USDT (البيتكوين)", "BTC/USDT", chat_id)
         except Exception as e:
             print(f"Listener error: {e}")
         time.sleep(2)
 
-# ==================== 6. الرادار التلقائي للصفقات الذهبية ====================
-def check_auto_signal(htf_df, ltf_df, asset_name):
+# ==================== 6. الرادار التلقائي للصفقات الذهبية مع الشارت ====================
+def check_auto_signal(htf_df, ltf_df, asset_name, chart_code):
     if htf_df.empty or ltf_df.empty or len(htf_df) < 205 or len(ltf_df) < 205:
         return None
     htf = enrich_indicators(htf_df)
     ltf = enrich_indicators(ltf_df)
     h_curr, l_curr = htf.iloc[-2], ltf.iloc[-2]
 
-    price = float(l_curr["close"])
+    price = round(float(l_curr["close"]), 2)
     atr = float(l_curr["ATR"])
-    adx = float(l_curr["ADX"])
+    adx = round(float(l_curr["ADX"]), 1)
     rsi = float(l_curr["RSI"])
 
     if float(l_curr["high"] - l_curr["low"]) > (2.8 * atr) or adx < 22:
@@ -301,38 +395,42 @@ def check_auto_signal(htf_df, ltf_df, asset_name):
     if htf_bull and (price > l_curr["EMA_200"]) and smc["bull"] and (45 <= rsi <= 67):
         sl = min(float(l_curr["low"]), float(l_curr["swing_low"])) - (0.4 * atr)
         risk = min(max(price - sl, 0.5 * atr), 1.8 * atr)
-        sl = price - risk
+        sl = round(price - risk, 2)
+        tp1 = round(price + 1.5 * risk, 2)
+        tp2 = round(price + 3.0 * risk, 2)
+        chart_buf = generate_chart_image(ltf, f"{chart_code} (15m)", price, sl, tp1, tp2, True)
         return {
             "asset": asset_name, "dir": "شراء مؤسسي (LONG) 🟢", "pat": smc["p_bull"],
-            "entry": round(price, 2), "sl": round(sl, 2),
-            "tp1": round(price + 1.5 * risk, 2), "tp2": round(price + 3.0 * risk, 2),
-            "adx": round(adx, 1), "time": str(l_curr["timestamp"])
+            "entry": price, "sl": sl, "tp1": tp1, "tp2": tp2,
+            "time": str(l_curr["timestamp"]), "chart": chart_buf
         }
 
     if htf_bear and (price < l_curr["EMA_200"]) and smc["bear"] and (33 <= rsi <= 55):
         sl = max(float(l_curr["high"]), float(l_curr["swing_high"])) + (0.4 * atr)
         risk = min(max(sl - price, 0.5 * atr), 1.8 * atr)
-        sl = price + risk
+        sl = round(price + risk, 2)
+        tp1 = round(price - 1.5 * risk, 2)
+        tp2 = round(price - 3.0 * risk, 2)
+        chart_buf = generate_chart_image(ltf, f"{chart_code} (15m)", price, sl, tp1, tp2, False)
         return {
             "asset": asset_name, "dir": "بيع مؤسسي (SHORT) 🔴", "pat": smc["p_bear"],
-            "entry": round(price, 2), "sl": round(sl, 2),
-            "tp1": round(price - 1.5 * risk, 2), "tp2": round(price - 3.0 * risk, 2),
-            "adx": round(adx, 1), "time": str(l_curr["timestamp"])
+            "entry": price, "sl": sl, "tp1": tp1, "tp2": tp2,
+            "time": str(l_curr["timestamp"]), "chart": chart_buf
         }
     return None
 
 def scanner_loop():
     send_msg(
-        "✅ *تم إضافة زر (⚡ مضاربة سريعة) بنجاح!*\n"
-        "اضغط الآن على زر *⚡ مضاربة سريعة* بالأسفل (أو أرسل /scalp) لتحليل فريم 5 دقائق و1 دقيقة للذهب والبيتكوين."
+        "🎨 *تم تفعيل ميزة الرسم البياني المصور (TradingView Chart) بنجاح!*\n"
+        "اضغط على أي زر بالأسفل لتصلك الصفقة مرفقة بصورة الشارت ومناطق الدخول والستوب والأهداف."
     )
     while True:
         try:
-            for key, name, fn in [
-                ("BTC", "BTC/USDT (البيتكوين)", get_btc_ohlcv),
-                ("GOLD", "XAU/USD (الذهب)", get_gold_ohlcv)
+            for key, name, code, fn in [
+                ("BTC", "BTC/USDT (البيتكوين)", "BTC/USDT", get_btc_ohlcv),
+                ("GOLD", "XAU/USD (الذهب)", "XAU/USD", get_gold_ohlcv)
             ]:
-                sig = check_auto_signal(fn(HTF), fn(LTF), name)
+                sig = check_auto_signal(fn(HTF), fn(LTF), name, code)
                 if sig and last_signal_candle[key] != sig["time"]:
                     alert = (
                         f"💎 *صفقة مكتملة الشروط (MTF + SMC)*\n"
@@ -345,7 +443,7 @@ def scanner_loop():
                         f"✅ *الهدف الأول (TP1):* `{sig['tp1']}`\n"
                         f"🚀 *الهدف الثاني (TP2):* `{sig['tp2']}`"
                     )
-                    send_msg(alert)
+                    send_photo_msg(sig["chart"], alert)
                     last_signal_candle[key] = sig["time"]
         except Exception as e:
             print(f"Scanner error: {e}")
@@ -353,12 +451,7 @@ def scanner_loop():
 
 @app.route("/")
 def home():
-    return "Pro Trading Bot + Scalping is Live 24/7!"
-
-@app.route("/test")
-def test():
-    threading.Thread(target=lambda: send_msg(scalp_analysis(get_gold_ohlcv("5m"), get_gold_ohlcv("1m"), "XAU/USD (الذهب)")), daemon=True).start()
-    return "جاري إرسال صفقة المضاربة السريعة للذهب إلى تيليجرام..."
+    return "Pro Trading Bot with Live Charts is Active 24/7!"
 
 if __name__ == "__main__":
     threading.Thread(target=telegram_listener, daemon=True).start()

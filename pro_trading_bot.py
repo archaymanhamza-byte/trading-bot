@@ -185,7 +185,7 @@ def get_gold_ohlcv(timeframe):
             return df
     return pd.DataFrame()
 
-# ==================== 2. حساب المؤشرات + MACD ====================
+# ==================== 2. حساب المؤشرات الفنية + MACD ====================
 def enrich_indicators(df):
     df = df.copy()
     for col in ["open", "high", "low", "close", "volume"]:
@@ -225,95 +225,89 @@ def enrich_indicators(df):
     df["ADX"] = dx.ewm(alpha=1/14, adjust=False).mean().fillna(20.0)
     return df
 
-# ==================== 3. خوارزمية كشف الدايفرجنس العادي والخفي على MACD ====================
-def detect_macd_divergence(plot_df):
+# ==================== 3. كشف هيكل السوق (BOS & CHoCH) ====================
+def detect_bos_choch(plot_df):
     """
-    فحص آخر 55 شمعة لاستخراج القمم والقيعان المحلية ومقارنتها بمؤشر MACD
-    ترجع بيانات الدايفرجنس النصية وإحداثيات الرسم على الشارت
+    رصد كسر الهيكل (BOS) وتغير الشخصية (CHoCH) عبر تتبع القمم والقيعان المحلية
     """
     n = len(plot_df)
+    if n < 15:
+        return []
+
+    piv_highs, piv_lows = [], []
+    for i in range(2, n - 1):
+        h = float(plot_df["high"].iloc[i])
+        l = float(plot_df["low"].iloc[i])
+        if h >= float(plot_df["high"].iloc[i - 1]) and h >= float(plot_df["high"].iloc[i - 2]) and h >= float(plot_df["high"].iloc[i + 1]):
+            piv_highs.append((i, h))
+        if l <= float(plot_df["low"].iloc[i - 1]) and l <= float(plot_df["low"].iloc[i - 2]) and l <= float(plot_df["low"].iloc[i + 1]):
+            piv_lows.append((i, l))
+
+    events = []
+    # فحص كسر آخر قمة أو قاعة لإثبات BOS أو CHoCH
+    if len(piv_highs) >= 2:
+        prev_h = piv_highs[-2][1]
+        last_h_idx, last_h_val = piv_highs[-1]
+        curr_c = float(plot_df["close"].iloc[-1])
+        if curr_c > prev_h:
+            events.append({
+                "type": "CHoCH" if curr_c > max([p[1] for p in piv_highs[:-1]], default=prev_h) else "BOS",
+                "bias": "BULL",
+                "level": prev_h,
+                "text": "CHoCH صاعد (تغير الشخصية)" if curr_c > max([p[1] for p in piv_highs[:-1]], default=prev_h) else "BOS صاعد (كسر هيكل)",
+                "color": "#00e676"
+            })
+
+    if len(piv_lows) >= 2:
+        prev_l = piv_lows[-2][1]
+        last_l_idx, last_l_val = piv_lows[-1]
+        curr_c = float(plot_df["close"].iloc[-1])
+        if curr_c < prev_l:
+            events.append({
+                "type": "CHoCH" if curr_c < min([p[1] for p in piv_lows[:-1]], default=prev_l) else "BOS",
+                "bias": "BEAR",
+                "level": prev_l,
+                "text": "CHoCH هابط (تغير الشخصية)" if curr_c < min([p[1] for p in piv_lows[:-1]], default=prev_l) else "BOS هابط (كسر هيكل)",
+                "color": "#ff5252"
+            })
+
+    return events
+
+# ==================== 4. كشف الدايفرجنس على MACD ====================
+def detect_macd_divergence(plot_df):
+    n = len(plot_df)
     if n < 20:
-        return {"found": False, "bias": None, "text": "لا يوجد دايفرجنس واضح حالياً", "label_en": ""}
+        return {"found": False, "bias": None, "text": "حيادي", "label_en": ""}
 
-    pivot_lows = []
-    pivot_highs = []
-
-    # استخراج القيعان والقمم المحلية (Pivot Lows & Pivot Highs)
+    pivot_lows, pivot_highs = [], []
     for i in range(2, n - 1):
         low_i = float(plot_df["low"].iloc[i])
         if low_i <= float(plot_df["low"].iloc[i - 1]) and low_i <= float(plot_df["low"].iloc[i - 2]) and low_i <= float(plot_df["low"].iloc[i + 1]):
-            if not pivot_lows or (i - pivot_lows[-1]) >= 4:
-                pivot_lows.append(i)
-
+            if not pivot_lows or (i - pivot_lows[-1]) >= 4: pivot_lows.append(i)
         high_i = float(plot_df["high"].iloc[i])
         if high_i >= float(plot_df["high"].iloc[i - 1]) and high_i >= float(plot_df["high"].iloc[i - 2]) and high_i >= float(plot_df["high"].iloc[i + 1]):
-            if not pivot_highs or (i - pivot_highs[-1]) >= 4:
-                pivot_highs.append(i)
+            if not pivot_highs or (i - pivot_highs[-1]) >= 4: pivot_highs.append(i)
 
     candidates = []
-
-    # 1. فحص الدايفرجنس الإيجابي (Bullish Regular & Hidden) بين آخر قاعين
     if len(pivot_lows) >= 2:
         i1, i2 = pivot_lows[-2], pivot_lows[-1]
         p1, p2 = float(plot_df["low"].iloc[i1]), float(plot_df["low"].iloc[i2])
         m1, m2 = float(plot_df["MACD"].iloc[i1]), float(plot_df["MACD"].iloc[i2])
-
         if p2 < p1 and m2 > m1:
-            candidates.append({
-                "found": True,
-                "bias": "BULL",
-                "div_type": "Regular Bullish",
-                "text": "🟢 دايفرجنس إيجابي عادي (Regular Bullish — انعكاس صاعد قوي)",
-                "label_en": "BULL DIV (Reg)",
-                "x1": i1, "x2": i2, "p1": p1, "p2": p2, "m1": m1, "m2": m2,
-                "color": "#00e676"
-            })
-        elif p2 > p1 and m2 < m1:
-            candidates.append({
-                "found": True,
-                "bias": "BULL",
-                "div_type": "Hidden Bullish",
-                "text": "🟢 دايفرجنس إيجابي خفي (Hidden Bullish — استمرار صاعد مع OTE)",
-                "label_en": "BULL DIV (Hid)",
-                "x1": i1, "x2": i2, "p1": p1, "p2": p2, "m1": m1, "m2": m2,
-                "color": "#00e676"
-            })
-
-    # 2. فحص الدايفرجنس السلبي (Bearish Regular & Hidden) بين آخر قمتين
+            candidates.append({"found": True, "bias": "BULL", "text": "🟢 دايفرجنس إيجابي (Regular Bullish)", "label_en": "BULL DIV", "x1": i1, "x2": i2, "p1": p1, "p2": p2, "m1": m1, "m2": m2, "color": "#00e676"})
     if len(pivot_highs) >= 2:
         i1, i2 = pivot_highs[-2], pivot_highs[-1]
         p1, p2 = float(plot_df["high"].iloc[i1]), float(plot_df["high"].iloc[i2])
         m1, m2 = float(plot_df["MACD"].iloc[i1]), float(plot_df["MACD"].iloc[i2])
-
         if p2 > p1 and m2 < m1:
-            candidates.append({
-                "found": True,
-                "bias": "BEAR",
-                "div_type": "Regular Bearish",
-                "text": "🔴 دايفرجنس سلبي عادي (Regular Bearish — انعكاس هابط قوي)",
-                "label_en": "BEAR DIV (Reg)",
-                "x1": i1, "x2": i2, "p1": p1, "p2": p2, "m1": m1, "m2": m2,
-                "color": "#ff5252"
-            })
-        elif p2 < p1 and m2 > m1:
-            candidates.append({
-                "found": True,
-                "bias": "BEAR",
-                "div_type": "Hidden Bearish",
-                "text": "🔴 دايفرجنس سلبي خفي (Hidden Bearish — استمرار هابط مع OTE)",
-                "label_en": "BEAR DIV (Hid)",
-                "x1": i1, "x2": i2, "p1": p1, "p2": p2, "m1": m1, "m2": m2,
-                "color": "#ff5252"
-            })
+            candidates.append({"found": True, "bias": "BEAR", "text": "🔴 دايفرجنس سلبي (Regular Bearish)", "label_en": "BEAR DIV", "x1": i1, "x2": i2, "p1": p1, "p2": p2, "m1": m1, "m2": m2, "color": "#ff5252"})
 
     if not candidates:
-        return {"found": False, "bias": None, "text": "حيادي (لا يوجد دايفرجنس مكتمل على آخر قمتين/قاعين)", "label_en": ""}
-
-    # اختيار الدايفرجنس الأحدث زمناً على الشارت
+        return {"found": False, "bias": None, "text": "حيادي", "label_en": ""}
     candidates.sort(key=lambda d: d["x2"], reverse=True)
     return candidates[0]
 
-# ==================== 4. دمج العرض والطلب مع فيبوناتشي OTE (0.618 - 0.786) ====================
+# ==================== 5. تحليل OTE والعرض والطلب ====================
 def analyze_structure_and_ote(df, is_long_bias=True):
     recent = df.tail(55).reset_index(drop=True)
     curr_price = float(recent["close"].iloc[-1])
@@ -367,27 +361,15 @@ def analyze_structure_and_ote(df, is_long_bias=True):
         ote_sweet = bull_ote_705
         overlap_low = max(demand_bottom, bull_ote_786)
         overlap_high = min(demand_top, bull_ote_618)
-        if overlap_low <= overlap_high:
-            sniper_zone = (round(overlap_low, 2), round(overlap_high, 2))
-            confluence_status = "🌟 تطابق ذهبي مباشر (Demand + OTE 70.5%)"
-        else:
-            z_low = round((demand_bottom + bull_ote_786) / 2, 2)
-            z_high = round((demand_top + bull_ote_618) / 2, 2)
-            sniper_zone = (min(z_low, z_high), max(z_low, z_high))
-            confluence_status = "✅ منطقة مدمجة (Demand + Discount OTE)"
+        sniper_zone = (round(overlap_low, 2), round(overlap_high, 2)) if overlap_low <= overlap_high else (round(demand_bottom, 2), round(demand_top, 2))
+        confluence_status = "🌟 تطابق ذهبي (Demand + OTE 70.5%)"
     else:
         ote_zone = (bear_ote_618, bear_ote_786)
         ote_sweet = bear_ote_705
         overlap_low = max(supply_bottom, bear_ote_618)
         overlap_high = min(supply_top, bear_ote_786)
-        if overlap_low <= overlap_high:
-            sniper_zone = (round(overlap_low, 2), round(overlap_high, 2))
-            confluence_status = "🌟 تطابق ذهبي مباشر (Supply + OTE 70.5%)"
-        else:
-            z_low = round((supply_bottom + bear_ote_618) / 2, 2)
-            z_high = round((supply_top + bear_ote_786) / 2, 2)
-            sniper_zone = (min(z_low, z_high), max(z_low, z_high))
-            confluence_status = "✅ منطقة مدمجة (Supply + Premium OTE)"
+        sniper_zone = (round(overlap_low, 2), round(overlap_high, 2)) if overlap_low <= overlap_high else (round(supply_bottom, 2), round(supply_top, 2))
+        confluence_status = "🌟 تطابق ذهبي (Supply + OTE 70.5%)"
 
     return {
         "bsl": round(swing_high, 2),
@@ -401,12 +383,12 @@ def analyze_structure_and_ote(df, is_long_bias=True):
         "supply_zone": (round(supply_bottom, 2), round(supply_top, 2))
     }
 
-# ==================== 5. رسم الشارت مع خطوط الدايفرجنس + OTE + العرض والطلب ====================
-def generate_chart_image(df, zones, div_info, asset_title, entry_zone, sl, exit_zone, is_long=True):
+# ==================== 6. رسم الشارت مع (BOS, CHoCH, OTE, العرض والطلب) ====================
+def generate_chart_image(df, zones, div_info, bos_events, asset_title, entry_zone, sl, exit_zone, is_long=True):
     try:
         plot_df = df.tail(55).reset_index(drop=True)
         fig, (ax, ax_macd) = plt.subplots(
-            2, 1, figsize=(10.5, 7.5), dpi=115, sharex=True,
+            2, 1, figsize=(10.5, 7.6), dpi=115, sharex=True,
             gridspec_kw={"height_ratios": [3.3, 1.1], "hspace": 0.08}
         )
         fig.patch.set_facecolor("#131722")
@@ -424,40 +406,31 @@ def generate_chart_image(df, zones, div_info, asset_title, entry_zone, sl, exit_
         x_end = len(plot_df) + 4
         ax.set_xlim(-1, x_end + 7)
 
-        # 1. رسم مناطق الطلب والعرض
+        # 1. العرض والطلب
         d_low, d_high = zones["demand_zone"]
         s_low, s_high = zones["supply_zone"]
-        ax.add_patch(patches.Rectangle(
-            (0, d_low), width=x_end, height=max(d_high - d_low, 1e-3),
-            facecolor="#00e676", alpha=0.13, edgecolor="#00e676", linewidth=1, zorder=1
-        ))
-        ax.add_patch(patches.Rectangle(
-            (0, s_low), width=x_end, height=max(s_high - s_low, 1e-3),
-            facecolor="#ff5252", alpha=0.13, edgecolor="#ff5252", linewidth=1, zorder=1
-        ))
+        ax.add_patch(patches.Rectangle((0, d_low), width=x_end, height=max(d_high - d_low, 1e-3), facecolor="#00e676", alpha=0.13, edgecolor="#00e676", linewidth=1, zorder=1))
+        ax.add_patch(patches.Rectangle((0, s_low), width=x_end, height=max(s_high - s_low, 1e-3), facecolor="#ff5252", alpha=0.13, edgecolor="#ff5252", linewidth=1, zorder=1))
         ax.text(0.8, (d_low + d_high) / 2, f" DEMAND ({d_low}-{d_high})", color="#00e676", fontsize=7, va="center", fontweight="bold")
         ax.text(0.8, (s_low + s_high) / 2, f" SUPPLY ({s_low}-{s_high})", color="#ff5252", fontsize=7, va="center", fontweight="bold")
 
-        # 2. رسم مستطيل فيبوناتشي الذهبي OTE
+        # 2. مستطيل OTE الذهبي
         ote_low, ote_high = zones["ote_zone"]
-        ax.add_patch(patches.Rectangle(
-            (len(plot_df) - 28, ote_low), width=32, height=max(ote_high - ote_low, 1e-3),
-            facecolor="#ffd700", alpha=0.22, edgecolor="#ffd700", linestyle="--", linewidth=1.3, zorder=2
-        ))
+        ax.add_patch(patches.Rectangle((len(plot_df) - 28, ote_low), width=32, height=max(ote_high - ote_low, 1e-3), facecolor="#ffd700", alpha=0.22, edgecolor="#ffd700", linestyle="--", linewidth=1.3, zorder=2))
         ax.axhline(zones["ote_sweet"], color="#ffd700", linestyle=":", linewidth=1.1, alpha=0.9)
-        ax.axhline(zones["eq_50"], color="#9e9e9e", linestyle=":", linewidth=0.9, alpha=0.75)
         ax.text(len(plot_df) - 27, zones["ote_sweet"], f" GOLDEN OTE | 70.5%: {zones['ote_sweet']}", color="#ffd700", fontsize=7.5, va="bottom", fontweight="bold")
 
-        # 3. رسم خطوط السيولة والـ EMA
+        # 3. رسم خطوط كسر الهيكل BOS و CHoCH على الشارت
+        for ev in bos_events:
+            ax.axhline(ev["level"], color=ev["color"], linestyle="--" if ev["type"] == "CHoCH" else "-", linewidth=1.2, alpha=0.9, zorder=4)
+            ax.text(len(plot_df) - 10, ev["level"], f" {ev['text']}", color=ev["color"], fontsize=7.5, va="bottom", fontweight="bold", zorder=5)
+
+        # 4. خطوط السيولة و الدخول والأهداف
         ax.axhline(zones["bsl"], color="#ffd54f", linestyle="-.", linewidth=1.0, alpha=0.8)
         ax.axhline(zones["ssl"], color="#ffd54f", linestyle="-.", linewidth=1.0, alpha=0.8)
         ax.text(x_end + 0.2, zones["bsl"], f" $$$ BSL: {zones['bsl']}", color="#ffd54f", fontsize=7.5, va="center", fontweight="bold")
         ax.text(x_end + 0.2, zones["ssl"], f" $$$ SSL: {zones['ssl']}", color="#ffd54f", fontsize=7.5, va="center", fontweight="bold")
 
-        ax.plot(plot_df.index, plot_df["EMA_50"], color="#2962ff", linewidth=1.2, label="EMA 50", zorder=5)
-        ax.plot(plot_df.index, plot_df["EMA_200"], color="#ff9800", linewidth=1.4, label="EMA 200", zorder=5)
-
-        # 4. رسم خطوط الدخول والستوب والأهداف
         e_mid = round((entry_zone[0] + entry_zone[1]) / 2, 2)
         tp1, tp2 = exit_zone
         ax.axhline(e_mid, color="#ffffff", linestyle="--", linewidth=1.2, alpha=0.95)
@@ -471,41 +444,31 @@ def generate_chart_image(df, zones, div_info, asset_title, entry_zone, sl, exit_
         ax.text(label_x, tp1, f" TP1: {tp1}", color="#26a69a", fontsize=8, va="center", fontweight="bold")
         ax.text(label_x, tp2, f" TP2: {tp2}", color="#00e676", fontsize=8, va="center", fontweight="bold")
 
-        # 5. لوحة MACD السفلية
+        # 5. لوحة MACD السفلية مع الدايفرجنس
         hist_colors = ["#26a69a" if v >= 0 else "#ef5350" for v in plot_df["MACD_HIST"]]
         ax_macd.bar(plot_df.index, plot_df["MACD_HIST"], color=hist_colors, width=0.6, alpha=0.75)
         ax_macd.plot(plot_df.index, plot_df["MACD"], color="#2962ff", linewidth=1.2, label="MACD")
         ax_macd.plot(plot_df.index, plot_df["MACD_SIGNAL"], color="#ff9800", linewidth=1.2, label="Signal")
         ax_macd.axhline(0, color="#787b86", linestyle="--", linewidth=0.8)
 
-        # 6. رسم خطوط الدايفرجنس على السعر وعلى مؤشر الماكد في حال وجوده
         if div_info and div_info.get("found"):
             x1, x2 = div_info["x1"], div_info["x2"]
             p1, p2 = div_info["p1"], div_info["p2"]
             m1, m2 = div_info["m1"], div_info["m2"]
             d_col = div_info["color"]
+            ax.plot([x1, x2], [p1, p2], color=d_col, linewidth=2.0, linestyle="-", marker="o", markersize=3, zorder=6)
+            ax.text((x1 + x2) / 2, (p1 + p2) / 2, f" {div_info['label_en']}", color=d_col, fontsize=7.5, fontweight="bold", zorder=7)
+            ax_macd.plot([x1, x2], [m1, m2], color=d_col, linewidth=2.0, linestyle="-", marker="o", markersize=3, zorder=6)
 
-            ax.plot([x1, x2], [p1, p2], color=d_col, linewidth=2.2, linestyle="-", marker="o", markersize=4, zorder=6)
-            ax.text((x1 + x2) / 2, (p1 + p2) / 2, f" {div_info['label_en']}", color=d_col, fontsize=8, fontweight="bold", zorder=7)
-
-            ax_macd.plot([x1, x2], [m1, m2], color=d_col, linewidth=2.2, linestyle="-", marker="o", markersize=4, zorder=6)
-            ax_macd.text((x1 + x2) / 2, (m1 + m2) / 2, f" {div_info['label_en']}", color=d_col, fontsize=7.5, fontweight="bold", zorder=7)
-
-        order_txt = "BUY LIMIT (OTE + DEMAND)" if is_long else "SELL LIMIT (OTE + SUPPLY)"
-        ax.set_title(f"{asset_title}  |  {order_txt}  |  MACD Divergence Detector", color="#ffffff", fontsize=10.5, fontweight="bold", pad=10)
-
+        ax.set_title(f"{asset_title}  |  SMC (BOS + CHoCH) + OTE + MACD", color="#ffffff", fontsize=10, fontweight="bold", pad=10)
         ax.grid(color="#2a2e39", linestyle="--", linewidth=0.5, alpha=0.6)
         ax.tick_params(colors="#b2b5be", labelsize=8)
-        for spine in ax.spines.values():
-            spine.set_color("#2a2e39")
-        ax.legend(loc="upper left", facecolor="#1e222d", edgecolor="#2a2e39", labelcolor="#ffffff", fontsize=7.5)
+        for spine in ax.spines.values(): spine.set_color("#2a2e39")
 
         ax_macd.set_ylabel("MACD", color="#b2b5be", fontsize=8)
         ax_macd.grid(color="#2a2e39", linestyle="--", linewidth=0.5, alpha=0.6)
         ax_macd.tick_params(colors="#b2b5be", labelsize=7.5)
-        for spine in ax_macd.spines.values():
-            spine.set_color("#2a2e39")
-        ax_macd.legend(loc="upper left", facecolor="#1e222d", edgecolor="#2a2e39", labelcolor="#ffffff", fontsize=7)
+        for spine in ax_macd.spines.values(): spine.set_color("#2a2e39")
 
         plt.tight_layout()
         buf = io.BytesIO()
@@ -518,22 +481,15 @@ def generate_chart_image(df, zones, div_info, asset_title, entry_zone, sl, exit_
         plt.close("all")
         return None
 
-# ==================== 6. بناء خطة الدخول مع تقييم التوافق والدايفرجنس ====================
+# ==================== 7. الأوامر المعلقة والمتابعة ====================
 def register_pending_trade(trade_key, asset_name, sym_type, is_long, entry_zone, sl, exit_zone, tf_label):
     with trades_lock:
         active_trades[trade_key] = {
-            "asset": asset_name,
-            "symbol_type": sym_type,
-            "is_long": is_long,
-            "entry_low": float(entry_zone[0]),
-            "entry_high": float(entry_zone[1]),
+            "asset": asset_name, "symbol_type": sym_type, "is_long": is_long,
+            "entry_low": float(entry_zone[0]), "entry_high": float(entry_zone[1]),
             "entry_mid": round((entry_zone[0] + entry_zone[1]) / 2, 2),
-            "sl": float(sl),
-            "tp1": float(exit_zone[0]),
-            "tp2": float(exit_zone[1]),
-            "status": "PENDING",
-            "tp1_hit": False,
-            "tf": tf_label,
+            "sl": float(sl), "tp1": float(exit_zone[0]), "tp2": float(exit_zone[1]),
+            "status": "PENDING", "tp1_hit": False, "tf": tf_label,
             "created_at": time.strftime("%H:%M UTC", time.gmtime())
         }
 
@@ -553,7 +509,7 @@ def analyze_and_send_zones(sym_type, ltf_str=None, chat_id=None):
         htf_df = get_btc_ohlcv(htf_use)
 
     if ltf_df.empty or len(ltf_df) < 35:
-        send_msg(f"⚠️ بيانات {asset_name} على فريم `{ltf_use}` غير متوفرة حالياً.", chat_id)
+        send_msg(f"⚠️ بيانات {asset_name} على فريم `{ltf_use}` غير متوفرة.", chat_id)
         return
     if htf_df.empty or len(htf_df) < 25:
         htf_df = ltf_df
@@ -561,159 +517,121 @@ def analyze_and_send_zones(sym_type, ltf_str=None, chat_id=None):
     ltf = enrich_indicators(ltf_df)
     htf = enrich_indicators(htf_df)
 
-    # فحص الدايفرجنس على آخر 55 شمعة
     plot_slice = ltf.tail(55).reset_index(drop=True)
     div_info = detect_macd_divergence(plot_slice)
+    bos_events = detect_bos_choch(plot_slice)
 
     l_curr = ltf.iloc[-1]
     h_curr = htf.iloc[-1]
-
     curr_price = round(float(l_curr["close"]), 2)
     atr = max(float(l_curr["ATR"]), curr_price * 0.001)
-    macd_hist = float(l_curr["MACD_HIST"])
-    macd_bull = float(l_curr["MACD"]) > float(l_curr["MACD_SIGNAL"])
+
     htf_bull = float(h_curr["close"]) > float(h_curr["EMA_200"])
     ltf_bull = curr_price > float(l_curr["EMA_50"])
 
-    # حساب نقاط الاتجاه مع إعطاء وزن إضافي للدايفرجنس المكتشف
-    bull_points = (2 if htf_bull else 0) + (1 if ltf_bull else 0) + (1 if macd_bull else 0)
-    if div_info["found"]:
-        if div_info["bias"] == "BULL":
-            bull_points += 2
-        elif div_info["bias"] == "BEAR":
-            bull_points -= 2
+    bull_points = (2 if htf_bull else 0) + (1 if ltf_bull else 0)
+    for ev in bos_events:
+        if ev["bias"] == "BULL": bull_points += 1
+        else: bull_points -= 1
 
     is_long = bull_points >= 2
-
     zones = analyze_structure_and_ote(ltf, is_long)
-    d_low, d_high = zones["demand_zone"]
-    s_low, s_high = zones["supply_zone"]
-    ote_low, ote_high = zones["ote_zone"]
-    ote_sweet = zones["ote_sweet"]
     entry_zone = zones["sniper_zone"]
+    s_low, s_high = zones["supply_zone"]
+    d_low, d_high = zones["demand_zone"]
     bsl, ssl = zones["bsl"], zones["ssl"]
     eq_50 = zones["eq_50"]
 
     if is_long:
-        order_type = "شراء معلق قناص (BUY LIMIT — OTE + Demand) 🟢"
+        order_type = "شراء معلق (BUY LIMIT — SMC OTE) 🟢"
         entry_mid = round((entry_zone[0] + entry_zone[1]) / 2, 2)
         sl = round(min(d_low, ssl, entry_zone[0]) - (0.4 * atr), 2)
         risk = max(entry_mid - sl, 0.5 * atr)
         tp1 = round(max(eq_50, entry_mid + (1.6 * risk)), 2)
-        tp2 = round(max(bsl, s_high, entry_mid + (3.2 * risk)), 2)
+        tp2 = round(max(bsl, entry_mid + (3.2 * risk)), 2)
         exit_zone = (tp1, tp2)
     else:
-        order_type = "بيع معلق قناص (SELL LIMIT — OTE + Supply) 🔴"
+        order_type = "بيع معلق (SELL LIMIT — SMC OTE) 🔴"
         entry_mid = round((entry_zone[0] + entry_zone[1]) / 2, 2)
         sl = round(max(s_high, bsl, entry_zone[1]) + (0.4 * atr), 2)
         risk = max(sl - entry_mid, 0.5 * atr)
         tp1 = round(min(eq_50, entry_mid - (1.6 * risk)), 2)
-        tp2 = round(min(ssl, d_low, entry_mid - (3.2 * risk)), 2)
+        tp2 = round(min(ssl, entry_mid - (3.2 * risk)), 2)
         exit_zone = (tp1, tp2)
 
-    # حساب درجة قوة الصفقة (Confidence Score)
-    conf_score = 72
-    if "🌟" in zones["confluence_status"]:
-        conf_score += 12
-    if div_info["found"] and ((is_long and div_info["bias"] == "BULL") or (not is_long and div_info["bias"] == "BEAR")):
-        conf_score += 14
-
-    htf_state = "صاعد 🟢" if htf_bull else "هابط 🔴"
     register_pending_trade(f"{sym_type}_{ltf_use}", asset_name, sym_type, is_long, entry_zone, sl, exit_zone, ltf_use)
 
+    bos_txt = "\n".join([f"• ⚡ `{ev['text']}` عند `{ev['level']}`" for ev in bos_events]) if bos_events else "• لا يوجد كسر هيكل نشط حالياً"
+
     caption = (
-        f"📐 *خطة القناص المتكاملة (OTE + العرض/الطلب + الدايفرجنس):*\n"
-        f"📊 *الأصل:* `{asset_name}` | *الفريم:* `{ltf_use}` (الاتجاه `{htf_use}`: {htf_state})\n"
-        f"💵 *السعر الحالي:* `{curr_price}` | *تقييم القوة:* `{min(conf_score, 98)}%`\n"
+        f"📐 *خطة القناص (SMC: BOS/CHoCH + OTE):*\n"
+        f"📊 *الأصل:* `{asset_name}` | *الفريم:* `{ltf_use}`\n"
+        f"💵 *السعر الحالي:* `{curr_price}`\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"🔍 *كاشف الدايفرجنس والمستويات الذهبية:*\n"
-        f"• 🧬 *دايفرجنس الماكد:* {div_info['text']}\n"
-        f"• 🟨 *منطقة الفيبوناتشي (OTE 0.618 - 0.786):* `{ote_low}` — `{ote_high}`\n"
-        f"• 🎯 *النقطة الذهبية (Sweet Spot 70.5%):* `{ote_sweet}`\n"
-        f"• 🟥 *العرض:* `{s_low} - {s_high}` | 🟩 *الطلب:* `{d_low} - {d_high}`\n"
-        f"• 💰 *السيولة:* BSL `{bsl}` | SSL `{ssl}`\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"📌 *الأمر المقترح:* {order_type}\n"
-        f"🔗 *حالة التوافق:* {zones['confluence_status']}\n"
+        f"🏛 *هيكل السوق (SMC):*\n{bos_txt}\n"
+        f"🧬 *الدايفرجنس والـ OTE:* {div_info['text']}\n"
         f"📍 *منطقة الدخول المحددة:* `{entry_zone[0]}` إلى `{entry_zone[1]}`\n"
-        f"🛑 *وقف الخسارة الهيكلي (SL):* `{sl}`\n"
-        f"✅ *منطقة الخروج 1 (TP1):* `{exit_zone[0]}`\n"
-        f"🚀 *منطقة الخروج 2 (TP2):* `{exit_zone[1]}`"
+        f"🛑 *وقف الخسارة (SL):* `{sl}`\n"
+        f"✅ *الهدف الأول (TP1):* `{exit_zone[0]}` | *الهدف الثاني (TP2):* `{exit_zone[1]}`"
     )
 
-    chart_buf = generate_chart_image(ltf, zones, div_info, f"{chart_code} ({ltf_use})", entry_zone, sl, exit_zone, is_long)
+    chart_buf = generate_chart_image(ltf, zones, div_info, bos_events, f"{chart_code} ({ltf_use})", entry_zone, sl, exit_zone, is_long)
     send_photo_msg(chart_buf, caption, sym_type, chat_id)
 
-# ==================== 7. متتبع الأوامر المعلقة والصفقات ====================
+# ==================== 8. متتبع الصفقات وأوامر تيليجرام ====================
 def get_latest_price_extremes(symbol_type):
     df = get_btc_ohlcv("1m", limit=3) if symbol_type == "BTC" else get_gold_ohlcv("5m")
-    if df.empty:
-        return None
-    last_row = df.iloc[-1]
-    return {
-        "close": round(float(last_row["close"]), 2),
-        "high": round(float(last_row["high"]), 2),
-        "low": round(float(last_row["low"]), 2)
-    }
+    if df.empty: return None
+    last = df.iloc[-1]
+    return {"close": round(float(last["close"]), 2), "high": round(float(last["high"]), 2), "low": round(float(last["low"]), 2)}
 
 def trade_tracker_loop():
     while True:
         try:
-            with trades_lock:
-                keys = list(active_trades.keys())
+            with trades_lock: keys = list(active_trades.keys())
             if keys:
                 cache = {}
                 for k in keys:
-                    with trades_lock:
-                        t = active_trades.get(k)
-                    if not t:
-                        continue
+                    with trades_lock: t = active_trades.get(k)
+                    if not t: continue
                     sym = t["symbol_type"]
-                    if sym not in cache:
-                        cache[sym] = get_latest_price_extremes(sym)
+                    if sym not in cache: cache[sym] = get_latest_price_extremes(sym)
                     p = cache[sym]
-                    if not p:
-                        continue
+                    if not p: continue
                     high_p, low_p, curr_p = p["high"], p["low"], p["close"]
 
                     if t["status"] == "PENDING":
                         if low_p <= t["entry_high"] and high_p >= t["entry_low"]:
                             with trades_lock:
-                                if k in active_trades:
-                                    active_trades[k]["status"] = "ACTIVE"
-                            send_msg(
-                                f"🔔 *تنبيه قناص: دخل السعر في منطقة (OTE + العرض/الطلب)!*\n"
-                                f"📊 *الأصل:* `{t['asset']}` (فريم `{t['tf']}`)\n"
-                                f"🎯 *منطقة الدخول:* `{t['entry_low']} - {t['entry_high']}`\n"
-                                f"💵 *السعر الآن:* `{curr_p}` | *الستوب:* `{t['sl']}`"
-                            )
+                                if k in active_trades: active_trades[k]["status"] = "ACTIVE"
+                            send_msg(f"🔔 *تفعيل صفقة SMC نشطة للأصل {t['asset']} عند منطقة الدخول!*")
                         continue
 
                     if t["is_long"]:
                         if high_p >= t["tp2"]:
-                            send_msg(f"🚀 *تحققت منطقة الخروج النهائية (TP2: {t['tp2']}) لـ {t['asset']} بنجاح!*")
+                            send_msg(f"🚀 *تحقق الهدف الثاني TP2 بنجاح للأصل {t['asset']}!*")
                             with trades_lock: active_trades.pop(k, None)
                         elif (not t["tp1_hit"]) and high_p >= t["tp1"]:
                             with trades_lock:
                                 if k in active_trades:
                                     active_trades[k]["tp1_hit"] = True
                                     active_trades[k]["sl"] = t["entry_mid"]
-                            send_msg(f"✅ *تحقق الهدف الأول (TP1: {t['tp1']}) لـ {t['asset']}!*\n🛡️ تم نقل الستوب إلى نقطة الدخول `{t['entry_mid']}`.")
+                            send_msg(f"✅ *تحقق TP1 وتأمين الستوب دخول لـ {t['asset']}!*")
                         elif low_p <= t["sl"]:
-                            send_msg(f"🛑 *ضرب السعر مستوى الوقف ({t['sl']}) لـ {t['asset']}.*")
+                            send_msg(f"🛑 *تم ضرب وقف الخسارة لـ {t['asset']}.*")
                             with trades_lock: active_trades.pop(k, None)
                     else:
                         if low_p <= t["tp2"]:
-                            send_msg(f"🚀 *تحققت منطقة الخروج النهائية (TP2: {t['tp2']}) لـ {t['asset']} بنجاح!*")
+                            send_msg(f"🚀 *تحقق الهدف الثاني TP2 بنجاح للأصل {t['asset']}!*")
                             with trades_lock: active_trades.pop(k, None)
                         elif (not t["tp1_hit"]) and low_p <= t["tp1"]:
                             with trades_lock:
                                 if k in active_trades:
                                     active_trades[k]["tp1_hit"] = True
                                     active_trades[k]["sl"] = t["entry_mid"]
-                            send_msg(f"✅ *تحقق الهدف الأول (TP1: {t['tp1']}) لـ {t['asset']}!*\n🛡️ تم نقل الستوب إلى نقطة الدخول `{t['entry_mid']}`.")
+                            send_msg(f"✅ *تحقق TP1 وتأمين الستوب دخول لـ {t['asset']}!*")
                         elif high_p >= t["sl"]:
-                            send_msg(f"🛑 *ضرب السعر مستوى الوقف ({t['sl']}) لـ {t['asset']}.*")
+                            send_msg(f"🛑 *تم ضرب وقف الخسارة لـ {t['asset']}.*")
                             with trades_lock: active_trades.pop(k, None)
         except Exception as e:
             print(f"Tracker error: {e}")
@@ -721,29 +639,18 @@ def trade_tracker_loop():
 
 def format_active_trades_report():
     with trades_lock:
-        if not active_trades:
-            return "📂 *لا توجد أوامر معلقة أو صفقات نشطة حالياً.*"
+        if not active_trades: return "📂 *لا توجد صفقات نشطة حالياً.*"
         snap = dict(active_trades)
-    lines = ["📂 *قائمة المناطق المعلقة والصفقات النشطة:*\n━━━━━━━━━━━━━━━━━━"]
+    lines = ["📂 *الأوامر والصفقات النشطة:*\n━━━━━━━━━━━━━━━━━━"]
     for k, t in snap.items():
-        st = "⏳ معلق بانتظار وصول السعر لمنطقة OTE" if t["status"] == "PENDING" else "🔥 مفعل داخل السوق"
-        d_txt = "شراء LONG 🟢" if t["is_long"] else "بيع SHORT 🔴"
-        lines.append(
-            f"🔹 *{t['asset']}* (فريم `{t['tf']}`) — {d_txt}\n"
-            f"   • الحالة: {st}\n"
-            f"   • منطقة الدخول: `{t['entry_low']} - {t['entry_high']}`\n"
-            f"   • الوقف: `{t['sl']}` | الخروج: `{t['tp1']}` ثم `{t['tp2']}`\n"
-            f"━━━━━━━━━━━━━━━━━━"
-        )
+        st = "⏳ بانتظار السعر" if t["status"] == "PENDING" else "🔥 مفعل بالسوق"
+        lines.append(f"🔹 *{t['asset']}* ({t['tf']}) | {st}\n   الدخول: `{t['entry_low']}-{t['entry_high']}` | SL: `{t['sl']}`")
     return "\n".join(lines)
 
-# ==================== 8. الاستماع لأوامر تيليجرام ====================
 def telegram_listener():
     if TELEGRAM_BOT_TOKEN:
-        try:
-            requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook", timeout=10)
-        except Exception:
-            pass
+        try: requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook", timeout=10)
+        except: pass
 
     offset = None
     while True:
@@ -754,7 +661,6 @@ def telegram_listener():
                 if res.get("ok"):
                     for item in res.get("result", []):
                         offset = item["update_id"] + 1
-
                         if "callback_query" in item:
                             cb = item["callback_query"]
                             cb_data = cb.get("data", "")
@@ -763,11 +669,7 @@ def telegram_listener():
                                 _, sym_t, chosen_tf = cb_data.split("|")
                                 user_settings["ltf"] = chosen_tf
                                 user_settings["htf"] = HTF_MAP.get(chosen_tf, "4h")
-                                requests.post(
-                                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
-                                    json={"callback_query_id": cb["id"], "text": f"جاري فحص الدايفرجنس و OTE على {chosen_tf}..."},
-                                    timeout=5
-                                )
+                                requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb["id"], "text": f"تحليل SMC على {chosen_tf}.."}, timeout=5)
                                 analyze_and_send_zones(sym_t, chosen_tf, cb_chat)
                             continue
 
@@ -776,32 +678,28 @@ def telegram_listener():
                         chat_id = str(msg.get("chat", {}).get("id", ""))
 
                         if text in ["/start", "/help"]:
-                            send_msg("🤖 *تم تفعيل كاشف الدايفرجنس (Regular & Hidden MACD Divergence) مع منطقة OTE!*\nاختر الأصل أو الفريم من الأزرار بالأسفل:", chat_id)
+                            send_msg("🤖 *منظومة SMC (BOS + CHoCH + OTE) تعمل بنجاح!*", chat_id)
                         elif text in ["⚡ فريم سكالب (5m)", "/scalp"]:
                             user_settings.update({"mode_name": TIMEFRAME_MODES["scalp"]["name"], "ltf": "5m", "htf": "15m"})
-                            send_msg("⚡ *تم التبديل إلى فريم السكالبينج (5m).* اضغط الآن على الذهب أو البيتكوين.", chat_id)
+                            send_msg("⚡ تم تفعيل فريم 5 دقائق للسكالبينج.", chat_id)
                         elif text in ["⏱ فريم متوسط (15m)", "/intraday"]:
                             user_settings.update({"mode_name": TIMEFRAME_MODES["intraday"]["name"], "ltf": "15m", "htf": "4h"})
-                            send_msg("⏱ *تم التبديل إلى الفريم المتوسط (15m).* اضغط الآن على الذهب أو البيتكوين.", chat_id)
+                            send_msg("⏱ تم تفعيل الفريم المتوسط 15 دقيقة.", chat_id)
                         elif text in ["🌊 فريم طويل (4h/1d)", "/swing"]:
                             user_settings.update({"mode_name": TIMEFRAME_MODES["swing"]["name"], "ltf": "4h", "htf": "1d"})
-                            send_msg("🌊 *تم التبديل إلى الفريم الطويل (4h/1d).* اضغط الآن على الذهب أو البيتكوين.", chat_id)
-                        elif text in ["/gold", "🪙 مناطق دخول الذهب", "🪙 تحليل الذهب فوراً"]:
-                            send_msg(f"⏳ *جاري فحص الدايفرجنس ومنطقة OTE للذهب (`{user_settings['ltf']}`)...*", chat_id)
+                            send_msg("🌊 تم تفعيل الفريم الطويل 4 ساعات.", chat_id)
+                        elif text in ["/gold", "🪙 مناطق دخول الذهب"]:
                             analyze_and_send_zones("GOLD", user_settings["ltf"], chat_id)
-                        elif text in ["/btc", "₿ مناطق دخول البيتكوين", "₿ تحليل البيتكوين فوراً"]:
-                            send_msg(f"⏳ *جاري فحص الدايفرجنس ومنطقة OTE للبيتكوين (`{user_settings['ltf']}`)...*", chat_id)
+                        elif text in ["/btc", "₿ مناطق دخول البيتكوين"]:
                             analyze_and_send_zones("BTC", user_settings["ltf"], chat_id)
-                        elif text in ["/status", "/all", "📊 فحص شامل بالسوق", "📊 فحص السوق الشامل"]:
-                            send_msg(f"⏳ *جاري الفحص الشامل (OTE + الدايفرجنس) على فريم `{user_settings['ltf']}`...*", chat_id)
+                        elif text in ["/status", "/all", "📊 فحص شامل بالسوق"]:
                             analyze_and_send_zones("GOLD", user_settings["ltf"], chat_id)
                             analyze_and_send_zones("BTC", user_settings["ltf"], chat_id)
-                        elif text in ["/trades", "📂 الأوامر المعلقة والنشطة", "📂 الصفقات النشطة"]:
+                        elif text in ["/trades", "📂 الأوامر المعلقة والنشطة"]:
                             send_msg(format_active_trades_report(), chat_id)
-                        elif text in ["/clear", "🗑️ مسح الصفقات", "🗑️ مسح الصفقات النشطة"]:
-                            with trades_lock:
-                                active_trades.clear()
-                            send_msg("🗑️ *تم مسح جميع الأوامر المعلقة والصفقات.*", chat_id)
+                        elif text in ["/clear", "🗑️ مسح الصفقات"]:
+                            with trades_lock: active_trades.clear()
+                            send_msg("🗑️ تم مسح الصفقات.", chat_id)
         except Exception as e:
             print(f"Listener error: {e}")
         time.sleep(2)
@@ -809,14 +707,12 @@ def telegram_listener():
 def keep_alive_pinger():
     while True:
         time.sleep(480)
-        try:
-            requests.get(f"{RENDER_EXTERNAL_URL}/health", timeout=10)
-        except Exception:
-            pass
+        try: requests.get(f"{RENDER_EXTERNAL_URL}/health", timeout=10)
+        except: pass
 
 @app.route("/")
 def home():
-    return "OTE + Supply/Demand + MACD Divergence Bot is Live 24/7!"
+    return "SMC BOS/CHoCH Bot is Live 24/7!"
 
 @app.route("/health")
 def health():
@@ -826,9 +722,6 @@ if __name__ == "__main__":
     threading.Thread(target=telegram_listener, daemon=True).start()
     threading.Thread(target=trade_tracker_loop, daemon=True).start()
     threading.Thread(target=keep_alive_pinger, daemon=True).start()
-    send_msg(
-        "🧬 *تم تفعيل كاشف الدايفرجنس (Regular & Hidden MACD Divergence) بنجاح!*\n"
-        "• سيرسم البوت الآن خطوط الدايفرجنس مباشرة على الشموع وعلى مؤشر الماكد مع حساب نسبة ثقة الصفقة."
-    )
+    send_msg("🏛 *تم تفعيل منظومة هيكل السوق الكاملة (BOS + CHoCH + OTE) بنجاح!*")
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)

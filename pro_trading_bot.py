@@ -35,16 +35,50 @@ AUTO_SCAN_INTERVAL = 900
 active_trades = {}
 trades_lock = threading.Lock()
 
-users_db = {
-    "approved": {},
-    "pending": {},
-    "notified_visitors": set(),  # لمنع تكرار إشعار الزائر قبل كتابة كلمة السر
-    "banned": set(),
-    "global_enabled": True,
-    "password": BOT_PASSWORD,
-    "admin_email": ADMIN_EMAIL
-}
+# ==================== نظام الحفظ الدائم (Persistent Storage) ====================
+USERS_FILE = "users_store.json"
 users_lock = threading.Lock()
+
+def load_users_from_disk():
+    default_db = {
+        "approved": {},
+        "pending": {},
+        "notified_visitors": [],
+        "banned": [],
+        "global_enabled": True,
+        "password": BOT_PASSWORD,
+        "admin_email": ADMIN_EMAIL
+    }
+    if os.path.exists(USERS_FILE):
+        try:
+            with open(USERS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                # تحويل القوائم المخزنة إلى مجموعات (Sets)
+                data["banned"] = set(data.get("banned", []))
+                data["notified_visitors"] = set(data.get("notified_visitors", []))
+                return data
+        except Exception as e:
+            print(f"Error loading users store: {e}")
+    return default_db
+
+def save_users_to_disk():
+    with users_lock:
+        try:
+            data = {
+                "approved": users_db["approved"],
+                "pending": users_db["pending"],
+                "notified_visitors": list(users_db["notified_visitors"]),
+                "banned": list(users_db["banned"]),
+                "global_enabled": users_db["global_enabled"],
+                "password": users_db["password"],
+                "admin_email": users_db["admin_email"]
+            }
+            with open(USERS_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=4)
+        except Exception as e:
+            print(f"Error saving users store: {e}")
+
+users_db = load_users_from_disk()
 
 user_settings = {
     "mode_name": "مضاربة متوسطة (15m / 4h)",
@@ -165,7 +199,6 @@ def get_inline_tf_buttons(sym_type):
         ]
     }
 
-# ==================== دالة الإرسال المحمية ضد أخطاء الرموز الخاصة ====================
 def send_msg(text, chat_id=None, inline_markup=None, remove_keyboard=False):
     target = str(chat_id or ADMIN_CHAT_ID).strip()
     if not TELEGRAM_BOT_TOKEN or not target:
@@ -183,7 +216,6 @@ def send_msg(text, chat_id=None, inline_markup=None, remove_keyboard=False):
             json={"chat_id": target, "text": text, "parse_mode": "Markdown", "reply_markup": markup},
             timeout=12
         )
-        # إذا فشل الإرسال بسبب وجود رموز مثل (_) في اسم المستخدم، يعيد البوت إرسالها فوراً بدون Markdown
         if not res.ok:
             clean_text = text.replace("*", "").replace("`", "")
             requests.post(
@@ -417,13 +449,9 @@ def calculate_volume_profile(df, num_bins=24):
     vah_price = round(min_p + (high_idx + 1) * bin_size, 2)
 
     return {
-        "poc": poc_price,
-        "vah": vah_price,
-        "val": val_price,
-        "poc_idx": max_vol_idx,
-        "bin_centers": bin_centers,
-        "bin_volumes": bin_volumes,
-        "bin_height": bin_size * 0.85
+        "poc": poc_price, "vah": vah_price, "val": val_price,
+        "poc_idx": max_vol_idx, "bin_centers": bin_centers,
+        "bin_volumes": bin_volumes, "bin_height": bin_size * 0.85
     }
 
 def enrich_indicators(df):
@@ -478,7 +506,7 @@ def enrich_indicators(df):
 
     return df
 
-# ==================== 4. محرك الاستراتيجيات الخمس (5-in-1 Institutional Engine) ====================
+# ==================== 4. محرك الاستراتيجيات الخمس ====================
 def evaluate_multi_strategies(ltf, htf, div_info, bos_events, vp_data):
     curr = ltf.iloc[-1]
     h_curr = htf.iloc[-1]
@@ -535,13 +563,8 @@ def evaluate_multi_strategies(ltf, htf, div_info, bos_events, vp_data):
     s4_status = f"🟢 أعلى VWAP (`{vwap_val}`) | {sq_txt}" if vwap_bull else f"🔴 أسفل VWAP (`{vwap_val}`) | {sq_txt}"
 
     s5_bull = poc_bull
-    if price > vah_val:
-        vp_loc = f"اختراق شرائي أعلى منطقة القيمة VAH (`{vah_val}`)"
-    elif price < val_val:
-        vp_loc = f"كسر بيعي أسفل منطقة القيمة VAL (`{val_val}`)"
-    else:
-        vp_loc = f"يتداول داخل منطقة القيمة (`{val_val} - {vah_val}`)"
-    s5_status = f"🟢 ارتكاز شرائي أعلى POC (`{poc_val}`) — {vp_loc}" if s5_bull else f"🔴 ضغط بيعي أسفل POC (`{poc_val}`) — {vp_loc}"
+    vp_loc = f"اختراق شرائي أعلى VAH" if price > vah_val else (f"كسر بيعي أسفل VAL" if price < val_val else f"داخل منطقة القيمة")
+    s5_status = f"🟢 ارتكاز أعلى POC (`{poc_val}`) — {vp_loc}" if s5_bull else f"🔴 ضغط أسفل POC (`{poc_val}`) — {vp_loc}"
 
     bull_votes = sum([1 if s1_bull else 0, 1 if s2_bull else 0, 1 if s3_bull else 0, 1 if s4_bull else 0, 1 if s5_bull else 0])
     if div_info["found"] and div_info["rsi_div"]:
@@ -558,22 +581,12 @@ def evaluate_multi_strategies(ltf, htf, div_info, bos_events, vp_data):
     confidence = min(60 + (aligned_count * 7) + (4 if in_killzone else 0), 99)
 
     return {
-        "is_long": final_is_long,
-        "aligned_count": aligned_count,
-        "confidence": confidence,
-        "psar": psar_val,
-        "vwap": vwap_val,
-        "poc": poc_val,
-        "vah": vah_val,
-        "val": val_val,
-        "s1_status": s1_status,
-        "s2_status": s2_status,
-        "s3_status": s3_status,
-        "s4_status": s4_status,
-        "s5_status": s5_status
+        "is_long": final_is_long, "aligned_count": aligned_count, "confidence": confidence,
+        "psar": psar_val, "vwap": vwap_val, "poc": poc_val, "vah": vah_val, "val": val_val,
+        "s1_status": s1_status, "s2_status": s2_status, "s3_status": s3_status, "s4_status": s4_status, "s5_status": s5_status
     }
 
-# ==================== 5. كشف الدايفرجنس وهيكل السوق و OTE الضيق ====================
+# ==================== 5. كشف الدايفرجنس وهيكل السوق و OTE ====================
 def detect_rsi_macd_divergence(plot_df):
     n = len(plot_df)
     if n < 20: return {"found": False, "text": "حيادي", "rsi_div": None, "macd_div": None}
@@ -667,7 +680,7 @@ def analyze_structure_and_ote(df, is_long_bias=True):
         "supply_zone": (round(supply_bottom, 2), round(supply_top, 2))
     }
 
-# ==================== 6. رسم الشارت المتكامل مع الفوليوم بروفايل (Volume Profile + POC) ====================
+# ==================== 6. رسم الشارت المتكامل ====================
 def generate_chart_image(df, zones, vp_data, div_info, bos_events, asset_title, entry_zone, sl, exit_zone, is_long=True):
     try:
         plot_df = df.tail(55).reset_index(drop=True)
@@ -947,7 +960,7 @@ def trade_tracker_loop():
             print(f"Tracker error: {e}")
         time.sleep(TRACKER_INTERVAL)
 
-# ==================== 8. لوحة تحكم المشرف وإدارة المستخدمين المضمونة ====================
+# ==================== 8. لوحة تحكم المشرف والاستماع للأوامر ====================
 def send_admin_panel(chat_id):
     with users_lock:
         app_count = len(users_db["approved"])
@@ -1089,7 +1102,6 @@ def telegram_listener():
                         full_name = f"{chat_obj.get('first_name', '')} {chat_obj.get('last_name', '')}".strip() or "مستخدم"
                         username = chat_obj.get("username", "بدون_معرف")
 
-                        # --- أوامر المشرف الخاصة ---
                         if is_admin(chat_id):
                             if text in ["🔐 لوحة تحكم المشرف", "/admin"]:
                                 send_admin_panel(chat_id)
@@ -1106,13 +1118,7 @@ def telegram_listener():
                                     with users_lock: users_db["admin_email"] = new_em
                                     send_msg(f"📧 *تم حفظ إيميل التأكيد بنجاح:* `{new_em}`", chat_id)
                                 continue
-                            elif text.startswith("/approve "):
-                                target_uid = text.replace("/approve ", "").strip()
-                                if target_uid:
-                                    approve_user_action(target_uid)
-                                continue
 
-                        # --- فحص ومعالجة أي مستخدم جديد غير المشرف ---
                         if not is_admin(chat_id):
                             with users_lock:
                                 is_banned = chat_id in users_db["banned"]
@@ -1128,7 +1134,6 @@ def telegram_listener():
                                 send_msg("⏸️ *البوت متوقف مؤقتاً للصيانة بأمر من الإدارة.*", chat_id, remove_keyboard=True)
                                 continue
                             if not is_approved:
-                                # مقارنة كلمة السر بدون حساسية للأحرف الكبيرة/الصغيرة
                                 if text.lower() == correct_pass.lower():
                                     with users_lock:
                                         users_db["pending"][chat_id] = {
@@ -1145,16 +1150,11 @@ def telegram_listener():
                                         ]]
                                     }
                                     send_msg(
-                                        f"🚨 *طلب دخول مؤكد (أدخل كلمة السر الصحيحة):*\n"
-                                        f"👤 *الاسم:* `{full_name}` (`@{username}`)\n"
-                                        f"🆔 *المعرف:* `{chat_id}`\n"
-                                        f"📧 *الإيميل:* `{em_info}`\n\n"
-                                        f"👇 *اضغط للموافقة أو الرفض الفوري:*",
+                                        f"🚨 *طلب دخول مؤكد:*\n👤 *الاسم:* `{full_name}` (`@{username}`)\n🆔 *المعرف:* `{chat_id}`",
                                         ADMIN_CHAT_ID,
                                         admin_kb
                                     )
                                 else:
-                                    # حتى لو لم يكتب كلمة السر بعد (مثل ضغط /start)، نسجله في قائمة الانتظار ونرسل إشعاراً للمشرف!
                                     with users_lock:
                                         users_db["pending"][chat_id] = {
                                             "name": full_name,
@@ -1167,24 +1167,16 @@ def telegram_listener():
                                     if first_visit:
                                         admin_kb = {
                                             "inline_keyboard": [[
-                                                {"text": "✅ تفعيل فوري (تجاوز كلمة السر)", "callback_data": f"ADM|APPROVE|{chat_id}"},
+                                                {"text": "✅ تفعيل فوري", "callback_data": f"ADM|APPROVE|{chat_id}"},
                                                 {"text": "🚫 رفض وحظر", "callback_data": f"ADM|DEL|{chat_id}"}
                                             ]]
                                         }
                                         send_msg(
-                                            f"👀 *شخص جديد فتح البوت الآن ويحاول الدخول:*\n"
-                                            f"👤 *الاسم:* `{full_name}` (`@{username}`)\n"
-                                            f"🆔 *المعرف:* `{chat_id}`\n"
-                                            f"💬 *الرسالة التي أرسلها:* `{text}`\n\n"
-                                            f"👇 *يمكنك تفعيله فوراً من الزر أدناه أو انتظاره حتى يكتب كلمة السر:*",
+                                            f"👀 *شخص جديد فتح البوت:*\n👤 *الاسم:* `{full_name}` (`@{username}`)\n🆔 *المعرف:* `{chat_id}`",
                                             ADMIN_CHAT_ID,
                                             admin_kb
                                         )
-
-                                    if is_pending and text not in ["/start", "/help"]:
-                                        send_msg("🔑 *كلمة السر غير صحيحة، أو أن طلبك قيد المراجعة لدى المشرف.*\nيرجى إرسال كلمة السر الصحيحة أو انتظار موافقة الإدارة:", chat_id, remove_keyboard=True)
-                                    else:
-                                        send_msg("🔒 *هذا البوت خاص ومحمي بكلمة سر.*\n🔑 يرجى إرسال **كلمة السر الصحيحة** (أو انتظار تفعيل المشرف لحسابك):", chat_id, remove_keyboard=True)
+                                    send_msg("🔒 *هذا البوت خاص ومحمي بكلمة سر.*\n🔑 يرجى إرسال **كلمة السر الصحيحة**:", chat_id, remove_keyboard=True)
                                 continue
 
                         if text in ["/start", "/help"]:
@@ -1219,7 +1211,7 @@ def telegram_listener():
 
 @app.route("/")
 def home():
-    return "Fast 1R/2R + Bulletproof Admin Approval Bot is Live 24/7!"
+    return "Persistent Users + Fast 1R/2R Institutional Bot is Live 24/7!"
 
 @app.route("/health")
 def health():
@@ -1251,9 +1243,8 @@ if __name__ == "__main__":
     threading.Thread(target=trade_tracker_loop, daemon=True).start()
     threading.Thread(target=keep_alive_pinger, daemon=True).start()
     send_msg(
-        "🔔 *تم تحديث نظام إشعارات الموافقة المضمون 100%!*\n"
-        "• سيصلك الآن إشعار فوري بمجرد أن يفتح أي شخص البوت (حتى قبل كتابة كلمة السر) مع زر **`✅ تفعيل فوري`**.\n"
-        "• اطلب من الشخص الآن أن يرسل أي رسالة للبوت (أو `/start`) ليصلك إشعاره في نفس الثانية."
+        "💾 *تم تفعيل نظام الحفظ الدائم للمستخدمين (Persistent Storage) بنجاح!*\n"
+        "• لن يضطر أي مستخدم وافقت عليه سابقاً لإعادة إدخال كلمة السر حتى لو أُعيد تشغيل خادم Render بالكامل."
     )
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)

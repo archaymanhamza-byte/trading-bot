@@ -107,11 +107,11 @@ user_settings = {
     "ltf": "15m",
     "htf": "4h",
     "profit_style": "scalp",
-    "lot_size": 0.01,        # حجم اللوت الافتراضي لحساب مسافة الدولارات
-    "tp1_usd": 5.0,          # الهدف الأول بالدولار
-    "tp2_usd": 10.0,         # الهدف الثاني بالدولار
-    "tp3_usd": 20.0,         # الهدف الثالث بالدولار
-    "sl_usd": 5.0            # وقف الخسارة بالدولار
+    "lot_size": 0.01,
+    "tp1_usd": 5.0,
+    "tp2_usd": 10.0,
+    "tp3_usd": 20.0,
+    "sl_usd": 5.0
 }
 
 TIMEFRAME_MODES = {
@@ -125,11 +125,6 @@ HTF_MAP = {
 }
 
 def usd_to_price_distance(sym_type, usd_amount, lot_size):
-    """
-    تحويل الربح المطلوب بالدولار إلى مسافة سعرية على الشارت:
-    - في الذهب (XAUUSD): عقد 1.00 لوت = 100 أونصة (أي عند لوت 0.01 كل 1 دولار حركة في السعر = 1 دولار ربح).
-    - في البيتكوين (BTCUSD): عقد 0.01 لوت = 0.01 عملة (أي كل 100 دولار حركة في السعر = 1 دولار ربح).
-    """
     safe_lot = max(float(lot_size), 0.001)
     if sym_type == "GOLD":
         return round(float(usd_amount) / (safe_lot * 100.0), 2)
@@ -711,19 +706,12 @@ def detect_bos_choch(plot_df):
     return events
 
 def analyze_structure_and_ote(df, is_long_bias=True, sym_type="GOLD", vp_data=None):
-    """
-    محرك الاقتناص القريب الذكي (Smart Proximity Entry):
-    - يبحث عن أقرب ارتكاز مؤسسي منطقي (EMA 20 / VWAP / POC / Micro FVG / 38.2%-50% Micro Wave).
-    - في السكالب (الذهب): يضع منطقة الدخول على بُعد 1.0$ إلى 2.2$ فقط من السعر الحالي.
-    - في السوينق (الذهب): يضع منطقة الدخول على بُعد 4.0$ إلى 8.0$ من السعر الحالي.
-    """
     recent_55 = df.tail(55).reset_index(drop=True)
     curr_row = recent_55.iloc[-1]
     curr_price = float(curr_row["close"])
     atr = max(float(curr_row["ATR"]), curr_price * 0.0008)
     rsi = float(curr_row["RSI"])
 
-    # السيولة الكلية ومناطق العرض والطلب للرسم العام على الشارت
     swing_high_55 = float(recent_55["high"].max())
     swing_low_55 = float(recent_55["low"].min())
     if swing_high_55 - swing_low_55 < (1.5 * atr):
@@ -736,7 +724,6 @@ def analyze_structure_and_ote(df, is_long_bias=True, sym_type="GOLD", vp_data=No
     supply_bottom = round(swing_high_55 - (0.6 * atr), 2)
     supply_top = round(swing_high_55, 2)
 
-    # تحديد نافذة القرب المسموحة حسب النمط (سكالب أم سوينق) وحسب الأصل (ذهب أم بيتكوين)
     is_swing_mode = (user_settings.get("profit_style") == "swing") or (user_settings.get("ltf") in ["4h", "1d"])
     micro_window = 22 if is_swing_mode else 12
     micro_df = df.tail(micro_window).reset_index(drop=True)
@@ -750,11 +737,9 @@ def analyze_structure_and_ote(df, is_long_bias=True, sym_type="GOLD", vp_data=No
             min_dist, ideal_dist, max_dist = 3.8, 5.5, 8.0
             half_band = 0.85
         else:
-            # مسافة السكالب في الذهب: قريبة جداً (1 إلى 2 دولار عن السعر الحالي)
             min_dist, ideal_dist, max_dist = 0.9, 1.45, 2.15
             half_band = 0.40
     else:
-        # للبيتكوين (نسبة من مؤشر التذبذب ATR)
         if is_swing_mode:
             min_dist, ideal_dist, max_dist = 0.45 * atr, 0.70 * atr, 1.05 * atr
             half_band = 0.18 * atr
@@ -762,13 +747,10 @@ def analyze_structure_and_ote(df, is_long_bias=True, sym_type="GOLD", vp_data=No
             min_dist, ideal_dist, max_dist = 0.18 * atr, 0.32 * atr, 0.50 * atr
             half_band = 0.10 * atr
 
-    # جمع المستويات الفنية المنطقية القريبة من السعر الحالي (Confluence Anchors)
     ema20_val = float(curr_row["EMA_20"])
-    ema50_val = float(curr_row["EMA_50"])
     vwap_val = float(curr_row["VWAP"])
     poc_val = float(vp_data["poc"]) if vp_data and "poc" in vp_data else curr_price
 
-    # فحص آخر فجوة سعرية مصغرة (Micro FVG) أو شمعة ارتكاز في آخر 12 شمعة
     micro_fvg_anchor = None
     for i in range(len(micro_df) - 1, 1, -1):
         c1, c3 = micro_df.iloc[i - 2], micro_df.iloc[i]
@@ -781,12 +763,11 @@ def analyze_structure_and_ote(df, is_long_bias=True, sym_type="GOLD", vp_data=No
 
     candidates = []
     if is_long_bias:
-        # مستويات الشراء المنطقية أسفل السعر الحالي
         fib_382 = curr_price - (0.382 * micro_span)
         fib_500 = curr_price - (0.500 * micro_span)
         prev_candle_low = float(micro_df["low"].iloc[-2]) if len(micro_df) >= 2 else (curr_price - ideal_dist)
 
-        raw_ anchors = [
+        raw_anchors = [
             (ema20_val, "ارتكاز المتوسط السريع EMA 20"),
             (vwap_val, "خط السيولة المؤسسي VWAP"),
             (poc_val, "نقطة التحكم بالحجم POC"),
@@ -803,20 +784,16 @@ def analyze_structure_and_ote(df, is_long_bias=True, sym_type="GOLD", vp_data=No
                 candidates.append((lvl, dist, reason_txt))
 
         if candidates:
-            # اختيار المستوى الأقرب للمسافة المثالية
             best_lvl, _, anchor_reason = min(candidates, key=lambda x: abs(x[1] - ideal_dist))
-            # إذا كان RSI متشبعاً شرائياً (> 68) نبعد الدخول قليلاً ضمن النافذة المسموحة لمنع المجازفة
             if rsi > 68:
                 best_lvl = min(best_lvl, curr_price - ideal_dist)
             sniper_mid = max(curr_price - max_dist, min(curr_price - min_dist, best_lvl))
         else:
-            # إذا لم يقع أي مؤشر داخل النافذة الضيقة، نضع الدخول عند المسافة المثالية المحسوبة
             pullback_d = max_dist if rsi > 68 else ideal_dist
             sniper_mid = curr_price - pullback_d
             anchor_reason = "تراجع تصحيحي آمن (Micro OTE Pullback)"
 
     else:
-        # مستويات البيع المنطقية أعلى السعر الحالي
         fib_382 = curr_price + (0.382 * micro_span)
         fib_500 = curr_price + (0.500 * micro_span)
         prev_candle_high = float(micro_df["high"].iloc[-2]) if len(micro_df) >= 2 else (curr_price + ideal_dist)
@@ -913,7 +890,6 @@ def generate_chart_image(df, zones, vp_data, div_info, bos_events, asset_title, 
         ax.add_patch(patches.Rectangle((0, d_low), width=x_end, height=max(d_high - d_low, 1e-3), facecolor="#00e676", alpha=0.12, edgecolor="#00e676", linewidth=1, zorder=1))
         ax.add_patch(patches.Rectangle((0, s_low), width=x_end, height=max(s_high - s_low, 1e-3), facecolor="#ff5252", alpha=0.12, edgecolor="#ff5252", linewidth=1, zorder=1))
 
-        # رسم مستطيل منطقة الدخول القريبة الذكية
         ote_low, ote_high = zones["ote_zone"]
         ax.add_patch(patches.Rectangle((len(plot_df) - 18, ote_low), width=22, height=max(ote_high - ote_low, 1e-3), facecolor="#ffd700", alpha=0.26, edgecolor="#ffd700", linestyle="--", linewidth=1.3, zorder=2))
         ax.axhline(zones["ote_sweet"], color="#ffd700", linestyle=":", linewidth=1.1, alpha=0.95)
@@ -1033,7 +1009,6 @@ def analyze_and_send_zones(sym_type, ltf_str=None, chat_id=None, silent_register
 
     zones = analyze_structure_and_ote(ltf, is_long, sym_type, vp_data)
     entry_zone = zones["sniper_zone"]
-    poc_p = vp_data["poc"]
 
     l_curr = ltf.iloc[-1]
     curr_price = round(float(l_curr["close"]), 2)
@@ -1634,8 +1609,8 @@ if __name__ == "__main__":
     threading.Thread(target=trade_tracker_loop, daemon=True).start()
     threading.Thread(target=keep_alive_pinger, daemon=True).start()
     send_msg(
-        "🎯 *تم تفعيل محرك الاقتناص القريب والآمن (Smart Proximity Entry)!*\n"
-        "• في نمط السكالب: مناطق دخول الذهب أصبحت تبعد **`1$ إلى 2$` فقط** عند أقرب ارتكاز مؤسسي.\n"
+        "🎯 *تم إصلاح الخطأ وتفعيل محرك الاقتناص القريب والآمن (Smart Proximity Entry) بنجاح!*\n"
+        "• في نمط السكالب: مناطق دخول الذهب تبعد **`1$ إلى 2$` فقط** عند أقرب ارتكاز مؤسسي.\n"
         "• في نمط السوينق: مناطق الدخول أوسع قليلاً (`4$ إلى 8$`) لتناسب الصفقات الطويلة."
     )
     port = int(os.environ.get("PORT", 10000))

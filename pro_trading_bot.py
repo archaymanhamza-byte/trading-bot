@@ -20,28 +20,26 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from flask import Flask, request
 
-# ==================== 1. الإعدادات الأساسية وإعدادات الحماية والإيميل ====================
+# ==================== 1. الإعدادات الأساسية وإعدادات الحماية ====================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-ADMIN_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()  # معرف المشرف (أنت)
+ADMIN_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "https://trading-bot-1-88ha.onrender.com").strip()
 
-# إعدادات كلمة السر والإيميل (يمكن تعديلها من Render أو بأوامر تيليجرام مباشرة)
 BOT_PASSWORD = os.getenv("BOT_PASSWORD", "Gold2026").strip()
-ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "").strip()          # الإيميل الذي ستصلك عليه طلبات التفعيل
-SMTP_USER = os.getenv("SMTP_USER", "").strip()              # إيميل الإرسال (Gmail)
-SMTP_APP_PASS = os.getenv("SMTP_APP_PASS", "").strip()      # كلمة مرور تطبيقات جيميل (App Password)
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "").strip()
+SMTP_USER = os.getenv("SMTP_USER", "").strip()
+SMTP_APP_PASS = os.getenv("SMTP_APP_PASS", "").strip()
 
 TRACKER_INTERVAL = 15
 AUTO_SCAN_INTERVAL = 900
 active_trades = {}
 trades_lock = threading.Lock()
 
-# قاعدة بيانات المستخدمين وصلاحياتهم
 users_db = {
-    "approved": {},          # chat_id -> {"name": ..., "username": ..., "joined": ...}
-    "pending": {},           # chat_id -> {"name": ..., "username": ..., "time": ...}
-    "banned": set(),         # معرفات المحظورين
-    "global_enabled": True,  # تشغيل/إيقاف البوت لدى المستخدمين
+    "approved": {},
+    "pending": {},
+    "banned": set(),
+    "global_enabled": True,
     "password": BOT_PASSWORD,
     "admin_email": ADMIN_EMAIL
 }
@@ -65,7 +63,6 @@ HTF_MAP = {
 
 app = Flask(__name__)
 
-# لوحة أزرار المستخدم العادي المفعّل
 USER_KEYBOARD = {
     "keyboard": [
         [{"text": "🪙 مناطق دخول الذهب"}, {"text": "₿ مناطق دخول البيتكوين"}],
@@ -77,7 +74,6 @@ USER_KEYBOARD = {
     "is_persistent": True
 }
 
-# لوحة أزرار المشرف (تظهر لك أنت فقط وتحتوي على زر لوحة التحكم)
 ADMIN_KEYBOARD = {
     "keyboard": [
         [{"text": "🪙 مناطق دخول الذهب"}, {"text": "₿ مناطق دخول البيتكوين"}],
@@ -97,14 +93,11 @@ def is_user_authorized(chat_id):
     if is_admin(cid):
         return True
     with users_lock:
-        if not users_db["global_enabled"]:
-            return False
-        if cid in users_db["banned"]:
+        if not users_db["global_enabled"] or cid in users_db["banned"]:
             return False
         return cid in users_db["approved"]
 
-def get_All_recipient_ids():
-    """إرجاع قائمة تضم المشرف + جميع المستخدمين المفعلين لإرسال التنبيهات"""
+def get_all_recipient_ids():
     recipients = []
     if ADMIN_CHAT_ID:
         recipients.append(str(ADMIN_CHAT_ID))
@@ -116,15 +109,13 @@ def get_All_recipient_ids():
     return recipients
 
 def get_action_token(chat_id, action):
-    """توليد رمز أمان لروابط القبول والرفض عبر الإيميل"""
     secret = f"{TELEGRAM_BOT_TOKEN}_{chat_id}_{action}"
     return hashlib.sha256(secret.encode()).hexdigest()[:16]
 
-# ==================== 2. إرسال إيميل التفعيل وإشعارات تيليجرام ====================
 def send_approval_email(user_id, full_name, username):
     target_email = users_db["admin_email"] or ADMIN_EMAIL
     if not target_email or not SMTP_USER or not SMTP_APP_PASS:
-        return False, "لم يتم ضبط إعدادات SMTP_USER و SMTP_APP_PASS بعد"
+        return False, "التأكيد مفعل عبر تيليجرام مباشرة"
 
     approve_tok = get_action_token(user_id, "approve")
     reject_tok = get_action_token(user_id, "reject")
@@ -134,16 +125,16 @@ def send_approval_email(user_id, full_name, username):
     subject = f"🔐 طلب تفعيل مستخدم جديد في بوت التداول: {full_name}"
     html_body = f"""
     <div dir="rtl" style="font-family: Arial, sans-serif; padding: 20px; background: #f4f6f9; border-radius: 10px;">
-        <h2 style="color: #131722;">🚨 طلب دخول جديد إلى بوت الذهب والبيتكوين</h2>
-        <p>أدخل المستخدم التالي <b>كلمة السر الصحيحة</b> وينتظر موافقتك لتفعيل حسابه:</p>
+        <h2>🚨 طلب دخول جديد إلى بوت الذهب والبيتكوين</h2>
+        <p>أدخل المستخدم التالي كلمة السر الصحيحة وينتظر موافقتك:</p>
         <ul>
             <li><b>الاسم:</b> {full_name}</li>
-            <li><b>المعرف (Username):</b> @{username}</li>
-            <li><b>رقم الحساب (Chat ID):</b> <code>{user_id}</code></li>
+            <li><b>المعرف:</b> @{username}</li>
+            <li><b>Chat ID:</b> <code>{user_id}</code></li>
         </ul>
         <p style="margin-top: 25px;">
-            <a href="{approve_url}" style="background: #00c853; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; margin-left: 10px;">✅ موافقة وتفعيل المستخدم</a>
-            <a href="{reject_url}" style="background: #d50000; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold;">🚫 رفض وحظر المستخدم</a>
+            <a href="{approve_url}" style="background: #00c853; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; margin-left: 10px;">✅ موافقة وتفعيل</a>
+            <a href="{reject_url}" style="background: #d50000; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold;">🚫 رفض وحظر</a>
         </p>
     </div>
     """
@@ -153,13 +144,11 @@ def send_approval_email(user_id, full_name, username):
         msg["From"] = SMTP_USER
         msg["To"] = target_email
         msg.attach(MIMEText(html_body, "html", "utf-8"))
-
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as server:
             server.login(SMTP_USER, SMTP_APP_PASS)
             server.sendmail(SMTP_USER, target_email, msg.as_string())
         return True, "تم إرسال الإيميل بنجاح"
     except Exception as e:
-        print(f"Email error: {e}")
         return False, str(e)
 
 def get_inline_tf_buttons(sym_type):
@@ -186,21 +175,16 @@ def send_msg(text, chat_id=None, inline_markup=None, remove_keyboard=False):
         markup = {"remove_keyboard": True}
     else:
         markup = ADMIN_KEYBOARD if is_admin(target) else USER_KEYBOARD
-
     try:
-        requests.post(
-            url,
-            json={"chat_id": target, "text": text, "parse_mode": "Markdown", "reply_markup": markup},
-            timeout=12
-        )
+        requests.post(url, json={"chat_id": target, "text": text, "parse_mode": "Markdown", "reply_markup": markup}, timeout=12)
     except Exception as e:
         print(f"Telegram text error: {e}")
 
 def broadcast_msg(text):
-    for uid in get_All_recipient_ids():
+    for uid in get_all_recipient_ids():
         send_msg(text, uid)
 
-# ==================== 3. محرك النطق البشري باللغة العربية ====================
+# ==================== 2. محرك النطق البشري باللغة العربية ====================
 def generate_fallback_alarm_wav(duration_sec=5.0):
     sample_rate = 12000
     num_samples = int(sample_rate * duration_sec)
@@ -234,7 +218,7 @@ def generate_arabic_tts_audio(spoken_text):
 
 def send_arabic_voice_alert(spoken_text, caption, chat_id=None):
     audio_bytes, filename, mime_type = generate_arabic_tts_audio(spoken_text)
-    targets = [str(chat_id)] if chat_id else get_All_recipient_ids()
+    targets = [str(chat_id)] if chat_id else get_all_recipient_ids()
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVoice"
     for target in targets:
         try:
@@ -266,7 +250,7 @@ def send_photo_msg(photo_buf, caption, sym_type="GOLD", chat_id=None):
     except Exception:
         send_msg(caption, target, inline_kb)
 
-# ==================== 4. جلب البيانات والمؤشرات ====================
+# ==================== 3. جلب البيانات وحساب المؤشرات + Volume Profile POC ====================
 def clean_yf_dataframe(raw):
     if raw is None or raw.empty: return pd.DataFrame()
     if isinstance(raw.columns, pd.MultiIndex): raw.columns = raw.columns.get_level_values(0)
@@ -326,6 +310,112 @@ def get_gold_ohlcv(timeframe):
         if not df.empty and len(df) > 35: return df
     return pd.DataFrame()
 
+def calc_parabolic_sar(df, af_start=0.02, af_step=0.02, af_max=0.20):
+    high = df["high"].values
+    low = df["low"].values
+    n = len(df)
+    psar = [0.0] * n
+    bull = True
+    af = af_start
+    ep = high[0]
+    psar[0] = low[0]
+
+    for i in range(1, n):
+        prev_psar = psar[i - 1]
+        if bull:
+            sar = prev_psar + af * (ep - prev_psar)
+            sar = min(sar, low[i - 1], low[max(0, i - 2)])
+            if low[i] < sar:
+                bull = False
+                sar = ep
+                ep = low[i]
+                af = af_start
+            else:
+                if high[i] > ep:
+                    ep = high[i]
+                    af = min(af + af_step, af_max)
+        else:
+            sar = prev_psar + af * (ep - prev_psar)
+            sar = max(sar, high[i - 1], high[max(0, i - 2)])
+            if high[i] > sar:
+                bull = True
+                sar = ep
+                ep = high[i]
+                af = af_start
+            else:
+                if low[i] < ep:
+                    ep = low[i]
+                    af = min(af + af_step, af_max)
+        psar[i] = sar
+    return pd.Series(psar, index=df.index)
+
+def calculate_volume_profile(df, num_bins=24):
+    """
+    حساب الفوليوم بروفايل (POC, VAH, VAL) وتوزيع السيولة الأفقي لآخر 55 شمعة
+    يدعم الفوليوم الحقيقي أو وزن المدى السعري (TPO Activity) في حال كان الفوليوم صفراً
+    """
+    recent = df.tail(55).copy()
+    min_p = float(recent["low"].min())
+    max_p = float(recent["high"].max())
+    if max_p <= min_p:
+        max_p = min_p + 1.0
+
+    bin_size = (max_p - min_p) / num_bins
+    bin_centers = [min_p + (i + 0.5) * bin_size for i in range(num_bins)]
+    bin_volumes = [0.0] * num_bins
+
+    for _, row in recent.iterrows():
+        h = float(row["high"])
+        l = float(row["low"])
+        v = float(row["volume"])
+        # إذا كان مصدر البيانات لا يرسل فوليوم في بعض الشموع، نستخدم نشاط الشمعة كوزن بديل
+        weight = v if v > 0 else max(h - l, 1.0)
+
+        for b_idx in range(num_bins):
+            b_low = min_p + b_idx * bin_size
+            b_high = b_low + bin_size
+            overlap = max(0.0, min(h, b_high) - max(l, b_low))
+            if overlap > 0:
+                candle_span = max(h - l, 1e-6)
+                bin_volumes[b_idx] += weight * (overlap / candle_span)
+            elif b_low <= float(row["close"]) <= b_high:
+                bin_volumes[b_idx] += weight * 0.5
+
+    max_vol_idx = int( max(range(num_bins), key=lambda i: bin_volumes[i]) )
+    poc_price = round(bin_centers[max_vol_idx], 2)
+
+    # حساب منطقة القيمة (Value Area 70% - VAH & VAL)
+    total_vol = sum(bin_volumes)
+    target_vol = total_vol * 0.70
+    accum_vol = bin_volumes[max_vol_idx]
+    low_idx = max_vol_idx
+    high_idx = max_vol_idx
+
+    while accum_vol < target_vol and (low_idx > 0 or high_idx < num_bins - 1):
+        up_vol = bin_volumes[high_idx + 1] if high_idx < num_bins - 1 else -1.0
+        dn_vol = bin_volumes[low_idx - 1] if low_idx > 0 else -1.0
+        if up_vol >= dn_vol and high_idx < num_bins - 1:
+            high_idx += 1
+            accum_vol += bin_volumes[high_idx]
+        elif low_idx > 0:
+            low_idx -= 1
+            accum_vol += bin_volumes[low_idx]
+        else:
+            break
+
+    val_price = round(min_p + low_idx * bin_size, 2)
+    vah_price = round(min_p + (high_idx + 1) * bin_size, 2)
+
+    return {
+        "poc": poc_price,
+        "vah": vah_price,
+        "val": val_price,
+        "poc_idx": max_vol_idx,
+        "bin_centers": bin_centers,
+        "bin_volumes": bin_volumes,
+        "bin_height": bin_size * 0.85
+    }
+
 def enrich_indicators(df):
     df = df.copy()
     for col in ["open", "high", "low", "close", "volume"]:
@@ -353,7 +443,130 @@ def enrich_indicators(df):
     low_close = (df["low"] - df["close"].shift(1)).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df["ATR"] = tr.ewm(alpha=1/14, adjust=False).mean().bfill()
+
+    up_move = df["high"].diff()
+    down_move = -df["low"].diff()
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+    atr_safe = df["ATR"].replace(0, 1e-9)
+    plus_di = 100 * (plus_dm.ewm(alpha=1/14, adjust=False).mean() / atr_safe)
+    minus_di = 100 * (minus_dm.ewm(alpha=1/14, adjust=False).mean() / atr_safe)
+    dx = 100 * ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, 1e-9))
+    df["ADX"] = dx.ewm(alpha=1/14, adjust=False).mean().fillna(20.0)
+
+    df["PSAR"] = calc_parabolic_sar(df)
+
+    typical_price = (df["high"] + df["low"] + df["close"]) / 3.0
+    vol_safe = df["volume"].replace(0, 1.0)
+    df["VWAP"] = (typical_price * vol_safe).rolling(window=30, min_periods=1).sum() / vol_safe.rolling(window=30, min_periods=1).sum()
+
+    df["BB_MID"] = df["close"].rolling(window=20, min_periods=1).mean()
+    bb_std = df["close"].rolling(window=20, min_periods=1).std().fillna(df["ATR"])
+    df["BB_UPPER"] = df["BB_MID"] + (2.0 * bb_std)
+    df["BB_LOWER"] = df["BB_MID"] - (2.0 * bb_std)
+    df["BB_WIDTH"] = (df["BB_UPPER"] - df["BB_LOWER"]) / df["BB_MID"].replace(0, 1e-9)
+
     return df
+
+# ==================== 4. محرك الاستراتيجيات الخمس (5-in-1 Institutional Engine) ====================
+def evaluate_multi_strategies(ltf, htf, div_info, bos_events, vp_data):
+    curr = ltf.iloc[-1]
+    h_curr = htf.iloc[-1]
+
+    price = float(curr["close"])
+    adx = round(float(curr["ADX"]), 1)
+    psar_val = round(float(curr["PSAR"]), 2)
+    vwap_val = round(float(curr["VWAP"]), 2)
+    poc_val = vp_data["poc"]
+    vah_val = vp_data["vah"]
+    val_val = vp_data["val"]
+
+    htf_bull = float(h_curr["close"]) > float(h_curr["EMA_200"])
+    ema_bull = price > float(curr["EMA_50"])
+    psar_bull = price > psar_val
+    vwap_bull = price > vwap_val
+    macd_bull = float(curr["MACD"]) > float(curr["MACD_SIGNAL"])
+    poc_bull = price >= poc_val
+
+    # 1. استراتيجية SMC + OTE
+    s1_bull = htf_bull and (ema_bull or any(e["bias"] == "BULL" for e in bos_events))
+    s1_status = "🟢 شراء (توافق هيكل SMC + OTE)" if s1_bull else "🔴 بيع (ضغط عرض SMC + OTE)"
+
+    # 2. استراتيجية ICT Silver Bullet
+    recent_15 = ltf.tail(15)
+    prev_low_15 = float(recent_15["low"].iloc[:-2].min())
+    prev_high_15 = float(recent_15["high"].iloc[:-2].max())
+    c1, c2, c3 = ltf.iloc[-3], ltf.iloc[-2], ltf.iloc[-1]
+
+    bull_fvg = float(c3["low"]) > float(c1["high"]) and float(c2["close"]) > float(c2["open"])
+    bear_fvg = float(c3["high"]) < float(c1["low"]) and float(c2["close"]) < float(c2["open"])
+    bull_sweep = float(recent_15["low"].tail(3).min()) <= prev_low_15 and price > prev_low_15
+    bear_sweep = float(recent_15["high"].tail(3).max()) >= prev_high_15 and price < prev_high_15
+
+    utc_hour = time.gmtime().tm_hour
+    in_killzone = (7 <= utc_hour <= 11) or (12 <= utc_hour <= 16)
+    kz_tag = "وقت سيولة Killzone 🔥" if in_killzone else "جلسة عادية"
+
+    if bull_sweep or bull_fvg:
+        s2_bull = True
+        s2_status = f"🟢 شراء ICT ({'سحب سيولة SSL' if bull_sweep else 'فجوة FVG صاعدة'} | {kz_tag})"
+    elif bear_sweep or bear_fvg:
+        s2_bull = False
+        s2_status = f"🔴 بيع ICT ({'سحب سيولة BSL' if bear_sweep else 'فجوة FVG هابطة'} | {kz_tag})"
+    else:
+        s2_bull = ema_bull
+        s2_status = f"⚖️ انتظار سحب سيولة ({kz_tag})"
+
+    # 3. استراتيجية Parabolic SAR + ADX
+    s3_bull = psar_bull
+    s3_status = f"🟢 صاعد أعلى SAR (`{psar_val}`) | ADX: `{adx}`" if s3_bull else f"🔴 هابط أسفل SAR (`{psar_val}`) | ADX: `{adx}`"
+
+    # 4. استراتيجية VWAP + Bollinger Squeeze
+    avg_bb_width = float(ltf["BB_WIDTH"].tail(40).mean())
+    is_squeeze = float(curr["BB_WIDTH"]) < (avg_bb_width * 0.85)
+    sq_txt = "⚡ انضغاط انفجاري" if is_squeeze else "تمدد طبيعي"
+    s4_bull = vwap_bull and macd_bull
+    s4_status = f"🟢 أعلى VWAP (`{vwap_val}`) | {sq_txt}" if vwap_bull else f"🔴 أسفل VWAP (`{vwap_val}`) | {sq_txt}"
+
+    # 5. استراتيجية الفوليوم بروفايل (Volume Profile POC + Value Area)
+    s5_bull = poc_bull
+    if price > vah_val:
+        vp_loc = f"اختراق شرائي أعلى منطقة القيمة VAH (`{vah_val}`)"
+    elif price < val_val:
+        vp_loc = f"كسر بيعي أسفل منطقة القيمة VAL (`{val_val}`)"
+    else:
+        vp_loc = f"يتداول داخل منطقة القيمة (`{val_val} - {vah_val}`)"
+    s5_status = f"🟢 ارتكاز شرائي أعلى POC (`{poc_val}`) — {vp_loc}" if s5_bull else f"🔴 ضغط بيعي أسفل POC (`{poc_val}`) — {vp_loc}"
+
+    bull_votes = sum([1 if s1_bull else 0, 1 if s2_bull else 0, 1 if s3_bull else 0, 1 if s4_bull else 0, 1 if s5_bull else 0])
+    if div_info["found"] and div_info["rsi_div"]:
+        bull_votes += 1 if div_info["rsi_div"]["bias"] == "BULL" else -1
+
+    final_is_long = bull_votes >= 3
+    aligned_count = sum([
+        1 if s1_bull == final_is_long else 0,
+        1 if s2_bull == final_is_long else 0,
+        1 if s3_bull == final_is_long else 0,
+        1 if s4_bull == final_is_long else 0,
+        1 if s5_bull == final_is_long else 0
+    ])
+    confidence = min(60 + (aligned_count * 7) + (4 if in_killzone else 0), 99)
+
+    return {
+        "is_long": final_is_long,
+        "aligned_count": aligned_count,
+        "confidence": confidence,
+        "psar": psar_val,
+        "vwap": vwap_val,
+        "poc": poc_val,
+        "vah": vah_val,
+        "val": val_val,
+        "s1_status": s1_status,
+        "s2_status": s2_status,
+        "s3_status": s3_status,
+        "s4_status": s4_status,
+        "s5_status": s5_status
+    }
 
 # ==================== 5. كشف الدايفرجنس وهيكل السوق و OTE ====================
 def detect_rsi_macd_divergence(plot_df):
@@ -448,25 +661,53 @@ def analyze_structure_and_ote(df, is_long_bias=True):
         "supply_zone": (round(supply_bottom, 2), round(supply_top, 2))
     }
 
-def generate_chart_image(df, zones, div_info, bos_events, asset_title, entry_zone, sl, exit_zone, is_long=True):
+# ==================== 6. رسم الشارت المتكامل مع الفوليوم بروفايل (Volume Profile + POC) ====================
+def generate_chart_image(df, zones, vp_data, div_info, bos_events, asset_title, entry_zone, sl, exit_zone, is_long=True):
     try:
         plot_df = df.tail(55).reset_index(drop=True)
         fig, (ax, ax_rsi, ax_macd) = plt.subplots(
-            3, 1, figsize=(10.5, 8.8), dpi=115, sharex=True,
-            gridspec_kw={"height_ratios": [3.2, 1.0, 1.0], "hspace": 0.08}
+            3, 1, figsize=(10.8, 9.2), dpi=115, sharex=True,
+            gridspec_kw={"height_ratios": [3.4, 1.0, 1.0], "hspace": 0.08}
         )
         fig.patch.set_facecolor("#131722")
         for a in [ax, ax_rsi, ax_macd]: a.set_facecolor("#131722")
 
+        # 1. رسم الأعمدة الأفقية للفوليوم بروفايل (Volume Profile Histogram) على يسار الشارت
+        max_v = max(vp_data["bin_volumes"]) if vp_data["bin_volumes"] else 1.0
+        for b_i, (b_center, b_vol) in enumerate(zip(vp_data["bin_centers"], vp_data["bin_volumes"])):
+            bar_w = (b_vol / max(max_v, 1e-9)) * 14.0
+            is_poc_bar = (b_i == vp_data["poc_idx"])
+            bar_col = "#00e5ff" if is_poc_bar else "#5c6bc0"
+            bar_alpha = 0.55 if is_poc_bar else 0.25
+            ax.barh(b_center, bar_w, height=vp_data["bin_height"], left=-1.0, color=bar_col, alpha=bar_alpha, edgecolor=bar_col, zorder=2)
+
+        # 2. رسم خط نقطة التحكم بالحجم (POC) وخطوط منطقة القيمة (VAH / VAL)
+        poc_p = vp_data["poc"]
+        vah_p = vp_data["vah"]
+        val_p = vp_data["val"]
+        x_end = len(plot_df) + 4
+        ax.set_xlim(-1.2, x_end + 8)
+
+        ax.axhline(poc_p, color="#00e5ff", linestyle="-", linewidth=1.7, alpha=0.95, label=f"POC ({poc_p})", zorder=4)
+        ax.axhline(vah_p, color="#00b0ff", linestyle=":", linewidth=0.9, alpha=0.75, zorder=2)
+        ax.axhline(val_p, color="#00b0ff", linestyle=":", linewidth=0.9, alpha=0.75, zorder=2)
+        ax.text(x_end + 0.2, poc_p, f" POC (Vol Control): {poc_p}", color="#00e5ff", fontsize=8, va="center", fontweight="bold")
+
+        # 3. رسم الشموع اليابانية
         for idx, row in plot_df.iterrows():
             o, h, l, c = float(row["open"]), float(row["high"]), float(row["low"]), float(row["close"])
             color = "#26a69a" if c >= o else "#ef5350"
             ax.plot([idx, idx], [l, h], color=color, linewidth=1.1, zorder=3)
             ax.bar(idx, max(abs(c - o), (h - l) * 0.02, 1e-4), bottom=min(o, c), width=0.62, color=color, edgecolor=color, zorder=4)
 
-        x_end = len(plot_df) + 4
-        ax.set_xlim(-1, x_end + 7)
+        # 4. رسم نقاط Parabolic SAR و خط VWAP المؤسسي
+        if "PSAR" in plot_df.columns:
+            psar_colors = ["#00e676" if plot_df["close"].iloc[i] >= plot_df["PSAR"].iloc[i] else "#ff5252" for i in range(len(plot_df))]
+            ax.scatter(plot_df.index, plot_df["PSAR"], c=psar_colors, s=11, alpha=0.9, label="Parabolic SAR", zorder=5)
+        if "VWAP" in plot_df.columns:
+            ax.plot(plot_df.index, plot_df["VWAP"], color="#e040fb", linewidth=1.3, linestyle="-.", label="VWAP", zorder=5)
 
+        # 5. رسم مناطق العرض والطلب ومستطيل OTE الذهبي
         d_low, d_high = zones["demand_zone"]
         s_low, s_high = zones["supply_zone"]
         ax.add_patch(patches.Rectangle((0, d_low), width=x_end, height=max(d_high - d_low, 1e-3), facecolor="#00e676", alpha=0.13, edgecolor="#00e676", linewidth=1, zorder=1))
@@ -493,11 +734,17 @@ def generate_chart_image(df, zones, div_info, bos_events, asset_title, entry_zon
         ax.text(label_x, sl, f" SL: {sl}", color="#ff1744", fontsize=8, va="center", fontweight="bold")
         ax.text(label_x, tp1, f" TP1: {tp1}", color="#26a69a", fontsize=8, va="center", fontweight="bold")
         ax.text(label_x, tp2, f" TP2: {tp2}", color="#00e676", fontsize=8, va="center", fontweight="bold")
+        ax.legend(loc="upper left", facecolor="#1e222d", edgecolor="#2a2e39", labelcolor="#ffffff", fontsize=7.5)
 
+        # 6. لوحة RSI و MACD
         ax_rsi.plot(plot_df.index, plot_df["RSI"], color="#ab47bc", linewidth=1.3)
         ax_rsi.axhline(70, color="#ef5350", linestyle=":", linewidth=0.8)
         ax_rsi.axhline(30, color="#26a69a", linestyle=":", linewidth=0.8)
         ax_rsi.set_ylabel("RSI", color="#b2b5be", fontsize=8)
+        if div_info and div_info.get("rsi_div"):
+            r_d = div_info["rsi_div"]
+            ax.plot([r_d["x1"], r_d["x2"]], [r_d["p1"], r_d["p2"]], color=r_d["color"], linewidth=2.0, marker="o", markersize=3, zorder=6)
+            ax_rsi.plot([r_d["x1"], r_d["x2"]], [r_d["v1"], r_d["v2"]], color=r_d["color"], linewidth=2.0, marker="o", markersize=3, zorder=6)
 
         hist_colors = ["#26a69a" if v >= 0 else "#ef5350" for v in plot_df["MACD_HIST"]]
         ax_macd.bar(plot_df.index, plot_df["MACD_HIST"], color=hist_colors, width=0.6, alpha=0.75)
@@ -505,8 +752,11 @@ def generate_chart_image(df, zones, div_info, bos_events, asset_title, entry_zon
         ax_macd.plot(plot_df.index, plot_df["MACD_SIGNAL"], color="#ff9800", linewidth=1.2)
         ax_macd.axhline(0, color="#787b86", linestyle="--", linewidth=0.8)
         ax_macd.set_ylabel("MACD", color="#b2b5be", fontsize=8)
+        if div_info and div_info.get("macd_div"):
+            m_d = div_info["macd_div"]
+            ax_macd.plot([m_d["x1"], m_d["x2"]], [m_d["v1"], m_d["v2"]], color=m_d["color"], linewidth=2.0, marker="o", markersize=3, zorder=6)
 
-        ax.set_title(f"{asset_title}  |  Protected VIP Trading System", color="#ffffff", fontsize=10, fontweight="bold", pad=10)
+        ax.set_title(f"{asset_title}  |  5-Strategy Engine + Volume Profile (POC: {poc_p})", color="#ffffff", fontsize=10, fontweight="bold", pad=10)
         for a in [ax, ax_rsi, ax_macd]:
             a.grid(color="#2a2e39", linestyle="--", linewidth=0.5, alpha=0.6)
             a.tick_params(colors="#b2b5be", labelsize=7.5)
@@ -523,7 +773,7 @@ def generate_chart_image(df, zones, div_info, bos_events, asset_title, entry_zon
         plt.close("all")
         return None
 
-# ==================== 6. تحليل وإرسال المناطق والرادار ====================
+# ==================== 7. بناء خطة التداول الشاملة بالاستراتيجيات الخمس ====================
 def register_pending_trade(trade_key, asset_name, sym_type, is_long, entry_zone, sl, exit_zone, tf_label):
     with trades_lock:
         old = active_trades.get(trade_key)
@@ -552,53 +802,69 @@ def analyze_and_send_zones(sym_type, ltf_str=None, chat_id=None, silent_register
         if not silent_register_only:
             send_msg(f"⚠️ بيانات {asset_name} غير متوفرة حالياً.", chat_id)
         return
-    if htf_df.empty: htf_df = ltf_df
+    if htf_df.empty or len(htf_df) < 25:
+        htf_df = ltf_df
 
     ltf = enrich_indicators(ltf_df)
+    htf = enrich_indicators(htf_df)
     plot_slice = ltf.tail(55).reset_index(drop=True)
     div_info = detect_rsi_macd_divergence(plot_slice)
     bos_events = detect_bos_choch(plot_slice)
+    vp_data = calculate_volume_profile(ltf, num_bins=24)
 
-    l_curr = ltf.iloc[-1]
-    curr_price = round(float(l_curr["close"]), 2)
-    atr = max(float(l_curr["ATR"]), curr_price * 0.001)
-
-    is_long = curr_price > float(l_curr["EMA_50"])
-    if div_info["found"] and div_info["rsi_div"]:
-        is_long = (div_info["rsi_div"]["bias"] == "BULL")
+    strat_matrix = evaluate_multi_strategies(ltf, htf, div_info, bos_events, vp_data)
+    is_long = strat_matrix["is_long"]
 
     zones = analyze_structure_and_ote(ltf, is_long)
     entry_zone = zones["sniper_zone"]
     s_low, s_high = zones["supply_zone"]
     d_low, d_high = zones["demand_zone"]
     bsl, ssl, eq_50 = zones["bsl"], zones["ssl"], zones["eq_50"]
+    poc_p = vp_data["poc"]
+
+    l_curr = ltf.iloc[-1]
+    curr_price = round(float(l_curr["close"]), 2)
+    atr = max(float(l_curr["ATR"]), curr_price * 0.001)
 
     if is_long:
+        dir_label = "شراء معلق (BUY LIMIT) 🟢"
         entry_mid = round((entry_zone[0] + entry_zone[1]) / 2, 2)
         sl = round(min(d_low, ssl, entry_zone[0]) - (0.4 * atr), 2)
         risk = max(entry_mid - sl, 0.5 * atr)
-        exit_zone = (round(max(eq_50, entry_mid + (1.6 * risk)), 2), round(max(bsl, entry_mid + (3.2 * risk)), 2))
+        tp1_target = max(eq_50, poc_p) if poc_p > entry_mid else eq_50
+        exit_zone = (round(max(tp1_target, entry_mid + (1.6 * risk)), 2), round(max(bsl, entry_mid + (3.2 * risk)), 2))
     else:
+        dir_label = "بيع معلق (SELL LIMIT) 🔴"
         entry_mid = round((entry_zone[0] + entry_zone[1]) / 2, 2)
         sl = round(max(s_high, bsl, entry_zone[1]) + (0.4 * atr), 2)
         risk = max(sl - entry_mid, 0.5 * atr)
-        exit_zone = (round(min(eq_50, entry_mid - (1.6 * risk)), 2), round(min(ssl, entry_mid - (3.2 * risk)), 2))
+        tp1_target = min(eq_50, poc_p) if poc_p < entry_mid else eq_50
+        exit_zone = (round(min(tp1_target, entry_mid - (1.6 * risk)), 2), round(min(ssl, entry_mid - (3.2 * risk)), 2))
 
     register_pending_trade(f"{sym_type}_{ltf_use}", asset_name, sym_type, is_long, entry_zone, sl, exit_zone, ltf_use)
     if silent_register_only:
         return
 
     caption = (
-        f"🗣️ *خطة القناص المحمية (OTE + SMC):*\n"
-        f"📊 *الأصل:* `{asset_name}` | *الفريم:* `{ltf_use}`\n"
-        f"💵 *السعر الحالي:* `{curr_price}`\n"
+        f"🧠 *تقرير محرك الاستراتيجيات الخمس (5-in-1 Engine):*\n"
+        f"📊 *الأصل:* `{asset_name}` | *الفريم:* `{ltf_use}` (الأكبر `{htf_use}`)\n"
+        f"💵 *السعر الحالي:* `{curr_price}` | *توافق الاستراتيجيات:* `{strat_matrix['aligned_count']}/5` (`{strat_matrix['confidence']}%`)\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"🧬 *الدايفرجنس:* {div_info['text']}\n"
+        f"📋 *مصفوفة الاستراتيجيات الخمس:*\n"
+        f"1️⃣ *SMC + OTE:* {strat_matrix['s1_status']}\n"
+        f"2️⃣ *ICT Silver Bullet:* {strat_matrix['s2_status']}\n"
+        f"3️⃣ *Parabolic SAR + ADX:* {strat_matrix['s3_status']}\n"
+        f"4️⃣ *VWAP + BB Squeeze:* {strat_matrix['s4_status']}\n"
+        f"5️⃣ *Volume Profile POC:* {strat_matrix['s5_status']}\n"
+        f"🧬 *الدايفرجنس (RSI/MACD):* {div_info['text']}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📌 *القرار الموحد:* {dir_label}\n"
+        f"🏛 *نقطة التحكم بالسيولة (POC):* `{poc_p}` (منطقة القيمة: `{vp_data['val']} - {vp_data['vah']}`)\n"
         f"🎯 *منطقة الدخول الذهبية (OTE):* `{entry_zone[0]}` إلى `{entry_zone[1]}`\n"
-        f"🛑 *وقف الخسارة (SL):* `{sl}`\n"
+        f"🛑 *وقف الخسارة الهيكلي (SL):* `{sl}`\n"
         f"✅ *الهدف الأول (TP1):* `{exit_zone[0]}` | *الهدف الثاني (TP2):* `{exit_zone[1]}`"
     )
-    chart_buf = generate_chart_image(ltf, zones, div_info, bos_events, f"{chart_code} ({ltf_use})", entry_zone, sl, exit_zone, is_long)
+    chart_buf = generate_chart_image(ltf, zones, vp_data, div_info, bos_events, f"{chart_code} ({ltf_use})", entry_zone, sl, exit_zone, is_long)
     send_photo_msg(chart_buf, caption, sym_type, chat_id)
 
 def auto_zone_scanner_loop():
@@ -678,7 +944,7 @@ def trade_tracker_loop():
             print(f"Tracker error: {e}")
         time.sleep(TRACKER_INTERVAL)
 
-# ==================== 7. لوحة تحكم المشرف وإدارة المستخدمين ====================
+# ==================== 8. لوحة تحكم المشرف والاستماع للأوامر ====================
 def send_admin_panel(chat_id):
     with users_lock:
         app_count = len(users_db["approved"])
@@ -696,10 +962,8 @@ def send_admin_panel(chat_id):
         f"🌐 *حالة البوت للمشتركين:* {g_state}\n"
         f"👥 *المفعلون:* `{app_count}` | *بانتظار الموافقة:* `{pend_count}` | *المحظورون:* `{ban_count}`\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"💡 *أوامر سريعة للمشرف:*\n"
         f"• لتغيير كلمة السر أرسل: `/setpass 12345`\n"
-        f"• لتحديد إيميلك أرسل: `/setemail name@gmail.com`\n"
-        f"👇 *اختر الإجراء المطلوب من الأزرار بالأسفل:*"
+        f"• لتحديد إيميلك أرسل: `/setemail name@gmail.com`"
     )
     inline_admin = {
         "inline_keyboard": [
@@ -721,7 +985,7 @@ def approve_user_action(uid):
             "username": info.get("username", ""),
             "joined": time.strftime("%Y-%m-%d %H:%M", time.gmtime())
         }
-    send_msg("🎉 *تمت موافقة المشرف على طلبك بنجاح!*\nيمكنك الآن استخدام جميع ميزات البوت من الأزرار بالأسفل:", uid)
+    send_msg("🎉 *تمت موافقة المشرف على طلبك بنجاح!*\nيمكنك الآن استخدام جميع استراتيجيات البوت الخمس من الأزرار بالأسفل:", uid)
     send_msg(f"✅ *تم تفعيل المستخدم:* `{info.get('name')}` (`{uid}`) بنجاح.", ADMIN_CHAT_ID)
 
 def reject_or_delete_user_action(uid):
@@ -742,7 +1006,6 @@ def format_active_trades_report():
         lines.append(f"🔹 *{t['asset']}* ({t['tf']}) | {st}\n   منطقة OTE: `{t['entry_low']} - {t['entry_high']}` | SL: `{t['sl']}`")
     return "\n".join(lines)
 
-# ==================== 8. الاستماع لتيليجرام والتحقق من كلمة السر ====================
 def telegram_listener():
     if TELEGRAM_BOT_TOKEN:
         try: requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook", timeout=10)
@@ -758,7 +1021,6 @@ def telegram_listener():
                     for item in res.get("result", []):
                         offset = item["update_id"] + 1
 
-                        # 1. معالجة الأزرار الشفافة (للمشرف وللفريمات)
                         if "callback_query" in item:
                             cb = item["callback_query"]
                             cb_data = cb.get("data", "")
@@ -788,7 +1050,7 @@ def telegram_listener():
                                     else:
                                         for u_id, u_info in app_copy.items():
                                             kb = {"inline_keyboard": [[{"text": f"❌ حذف وحظر {u_info['name']}", "callback_data": f"ADM|DEL|{u_id}"}]]}
-                                            send_msg(f"👤 *المستخدم:* `{u_info['name']}` (@{u_info['username']})\n🆔 المعرف: `{u_id}`\n📅 التفعيل: `{u_info['joined']}`", cb_chat, kb)
+                                            send_msg(f"👤 *المستخدم:* `{u_info['name']}` (@{u_info['username']})\n🆔 المعرف: `{u_id}`", cb_chat, kb)
                                 elif action == "LIST_PENDING":
                                     with users_lock: pend_copy = dict(users_db["pending"])
                                     if not pend_copy:
@@ -812,7 +1074,6 @@ def telegram_listener():
                                 analyze_and_send_zones(sym_t, chosen_tf, cb_chat)
                             continue
 
-                        # 2. قراءة الرسائل النصية
                         msg = item.get("message", {})
                         text = msg.get("text", "").strip()
                         if not text:
@@ -822,7 +1083,6 @@ def telegram_listener():
                         full_name = f"{chat_obj.get('first_name', '')} {chat_obj.get('last_name', '')}".strip() or "مستخدم"
                         username = chat_obj.get("username", "بدون_معرف")
 
-                        # --- أوامر المشرف الخاصة ---
                         if is_admin(chat_id):
                             if text in ["🔐 لوحة تحكم المشرف", "/admin"]:
                                 send_admin_panel(chat_id)
@@ -840,7 +1100,6 @@ def telegram_listener():
                                     send_msg(f"📧 *تم حفظ إيميل التأكيد بنجاح:* `{new_em}`", chat_id)
                                 continue
 
-                        # --- فحص صلاحية المستخدم غير المشرف ---
                         if not is_admin(chat_id):
                             with users_lock:
                                 is_banned = chat_id in users_db["banned"]
@@ -855,13 +1114,10 @@ def telegram_listener():
                             if not is_global_on:
                                 send_msg("⏸️ *البوت متوقف مؤقتاً للصيانة بأمر من الإدارة.*", chat_id, remove_keyboard=True)
                                 continue
-
                             if not is_approved:
                                 if is_pending:
-                                    send_msg("⏳ *طلبك قيد المراجعة لدى المشرف.* ستصلك رسالة فور تأكيد تفعيل حسابك.", chat_id, remove_keyboard=True)
+                                    send_msg("⏳ *طلبك قيد المراجعة لدى المشرف.*", chat_id, remove_keyboard=True)
                                     continue
-
-                                # التحقق مما إذا كان المستخدم قد أرسل كلمة السر الصحيحة
                                 if text == correct_pass:
                                     with users_lock:
                                         users_db["pending"][chat_id] = {
@@ -869,14 +1125,7 @@ def telegram_listener():
                                             "username": username,
                                             "time": time.strftime("%Y-%m-%d %H:%M", time.gmtime())
                                         }
-                                    send_msg(
-                                        "✅ *كلمة السر صحيحة!*\n"
-                                        "📧 تم إرسال طلب تفعيل حسابك إلى البريد الإلكتروني للمشرف للموافقة النهائية.\n"
-                                        "⏳ يرجى الانتظار، ستصلك رسالة هنا فور تفعيلك.",
-                                        chat_id,
-                                        remove_keyboard=True
-                                    )
-                                    # إرسال إيميل التفعيل + بطاقة موافقة فورية للمشرف على تيليجرام
+                                    send_msg("✅ *كلمة السر صحيحة!* تم إرسال طلب تفعيل حسابك إلى المشرف للموافقة النهائية.", chat_id, remove_keyboard=True)
                                     em_ok, em_info = send_approval_email(chat_id, full_name, username)
                                     admin_kb = {
                                         "inline_keyboard": [[
@@ -885,28 +1134,18 @@ def telegram_listener():
                                         ]]
                                     }
                                     send_msg(
-                                        f"🚨 *طلب دخول جديد للبوت (أدخل كلمة السر الصحيحة):*\n"
-                                        f"👤 *الاسم:* `{full_name}` (@{username})\n"
-                                        f"🆔 *المعرف:* `{chat_id}`\n"
-                                        f"📧 *حالة الإيميل:* `{em_info}`\n\n"
-                                        f"👇 *اضغط للموافقة أو الرفض الفوري:*",
+                                        f"🚨 *طلب دخول جديد للبوت:*\n👤 *الاسم:* `{full_name}` (@{username})\n🆔 *المعرف:* `{chat_id}`\n📧 *الإيميل:* `{em_info}`",
                                         ADMIN_CHAT_ID,
                                         admin_kb
                                     )
                                 else:
-                                    send_msg(
-                                        "🔒 *هذا البوت خاص ومحمي بكلمة سر.*\n"
-                                        "🔑 يرجى إرسال **كلمة السر الصحيحة** أولاً لتقديم طلب الدخول:",
-                                        chat_id,
-                                        remove_keyboard=True
-                                    )
+                                    send_msg("🔒 *هذا البوت خاص ومحمي بكلمة سر.*\n🔑 يرجى إرسال **كلمة السر الصحيحة** أولاً:", chat_id, remove_keyboard=True)
                                 continue
 
-                        # --- أوامرك وأوامر المستخدمين المفعلين ---
                         if text in ["/start", "/help"]:
-                            send_msg("🤖 *أهلاً بك في بوت القناص الاحترافي!* اختر الأصل أو الفريم من الأزرار بالأسفل:", chat_id)
+                            send_msg("🤖 *أهلاً بك في محرك الاستراتيجيات الخمس (SMC + ICT + PSAR + VWAP + Volume Profile POC)!*", chat_id)
                         elif text in ["🔊 تجربة الناطق العربي", "/sound"]:
-                            test_speech = "أهلاً بك، نظام التنبيه الصوتي باللغة العربية يعمل بنجاح. تنبيه، وصل سعر الذهب إلى منطقة الدخول الذهبية."
+                            test_speech = "أهلاً بك، محرك الفوليوم بروفايل والاستراتيجيات الخمس يعمل بنجاح."
                             send_arabic_voice_alert(test_speech, "🗣️ *تجربة الناطق الصوتي باللغة العربية*", chat_id)
                         elif text in ["⚡ فريم سكالب (5m)", "/scalp"]:
                             user_settings.update({"mode_name": TIMEFRAME_MODES["scalp"]["name"], "ltf": "5m", "htf": "15m"})
@@ -933,10 +1172,9 @@ def telegram_listener():
             print(f"Listener error: {e}")
         time.sleep(2)
 
-# ==================== 9. روابط التفعيل عبر الإيميل والنبض الذاتي ====================
 @app.route("/")
 def home():
-    return "Protected VIP Trading Bot is Live 24/7!"
+    return "5-Strategy Institutional + Volume Profile POC Bot is Live 24/7!"
 
 @app.route("/health")
 def health():
@@ -944,22 +1182,17 @@ def health():
 
 @app.route("/admin/action")
 def admin_email_action():
-    """هذا الرابط يعمل عند الضغط على زر الموافقة أو الرفض من داخل رسالة الإيميل مباشرة"""
     uid = request.args.get("uid", "").strip()
     act = request.args.get("act", "").strip()
     tok = request.args.get("token", "").strip()
-
-    if not uid or act not in ["approve", "reject"]:
-        return "<h3>❌ رابط غير صالح</h3>", 400
-    if tok != get_action_token(uid, act):
-        return "<h3>❌ رمز الأمان غير صحيح</h3>", 403
-
+    if not uid or act not in ["approve", "reject"] or tok != get_action_token(uid, act):
+        return "<h3>❌ رابط غير صالح</h3>", 403
     if act == "approve":
         approve_user_action(uid)
-        return f"<h2 style='color:green; font-family:Tahoma;'>✅ تم تفعيل المستخدم ({uid}) بنجاح!</h2>"
+        return f"<h2 style='color:green;'>✅ تم تفعيل المستخدم ({uid}) بنجاح!</h2>"
     else:
         reject_or_delete_user_action(uid)
-        return f"<h2 style='color:red; font-family:Tahoma;'>🚫 تم رفض وحظر المستخدم ({uid}) بنجاح!</h2>"
+        return f"<h2 style='color:red;'>🚫 تم رفض وحظر المستخدم ({uid}) بنجاح!</h2>"
 
 def keep_alive_pinger():
     while True:
@@ -973,10 +1206,8 @@ if __name__ == "__main__":
     threading.Thread(target=trade_tracker_loop, daemon=True).start()
     threading.Thread(target=keep_alive_pinger, daemon=True).start()
     send_msg(
-        "🔐 *تم تفعيل نظام الحماية بكلمة سر + لوحة تحكم المشرف بنجاح!*\n"
-        f"• كلمة السر الافتراضية الحالية هي: `{BOT_PASSWORD}`\n"
-        "• لتغيير كلمة السر في أي وقت أرسل: `/setpass كلمة_جديدة`\n"
-        "• اضغط على زر **`🔐 لوحة تحكم المشرف`** بالأسفل لإدارة المستخدمين أو حذف أي مستخدم."
+        "🏛 *تم إضافة الفوليوم بروفايل (Volume Profile POC + Value Area) بنجاح!*\n"
+        "• سيظهر الآن على يسار الشارت توزيع السيولة الأفقي مع خط الارتكاز المؤسسي **`POC`** باللون السماوي الساطع."
     )
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)

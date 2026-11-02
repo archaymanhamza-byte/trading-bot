@@ -350,10 +350,6 @@ def calc_parabolic_sar(df, af_start=0.02, af_step=0.02, af_max=0.20):
     return pd.Series(psar, index=df.index)
 
 def calculate_volume_profile(df, num_bins=24):
-    """
-    حساب الفوليوم بروفايل (POC, VAH, VAL) وتوزيع السيولة الأفقي لآخر 55 شمعة
-    يدعم الفوليوم الحقيقي أو وزن المدى السعري (TPO Activity) في حال كان الفوليوم صفراً
-    """
     recent = df.tail(55).copy()
     min_p = float(recent["low"].min())
     max_p = float(recent["high"].max())
@@ -368,7 +364,6 @@ def calculate_volume_profile(df, num_bins=24):
         h = float(row["high"])
         l = float(row["low"])
         v = float(row["volume"])
-        # إذا كان مصدر البيانات لا يرسل فوليوم في بعض الشموع، نستخدم نشاط الشمعة كوزن بديل
         weight = v if v > 0 else max(h - l, 1.0)
 
         for b_idx in range(num_bins):
@@ -381,10 +376,9 @@ def calculate_volume_profile(df, num_bins=24):
             elif b_low <= float(row["close"]) <= b_high:
                 bin_volumes[b_idx] += weight * 0.5
 
-    max_vol_idx = int( max(range(num_bins), key=lambda i: bin_volumes[i]) )
+    max_vol_idx = int(max(range(num_bins), key=lambda i: bin_volumes[i]))
     poc_price = round(bin_centers[max_vol_idx], 2)
 
-    # حساب منطقة القيمة (Value Area 70% - VAH & VAL)
     total_vol = sum(bin_volumes)
     target_vol = total_vol * 0.70
     accum_vol = bin_volumes[max_vol_idx]
@@ -488,11 +482,9 @@ def evaluate_multi_strategies(ltf, htf, div_info, bos_events, vp_data):
     macd_bull = float(curr["MACD"]) > float(curr["MACD_SIGNAL"])
     poc_bull = price >= poc_val
 
-    # 1. استراتيجية SMC + OTE
     s1_bull = htf_bull and (ema_bull or any(e["bias"] == "BULL" for e in bos_events))
     s1_status = "🟢 شراء (توافق هيكل SMC + OTE)" if s1_bull else "🔴 بيع (ضغط عرض SMC + OTE)"
 
-    # 2. استراتيجية ICT Silver Bullet
     recent_15 = ltf.tail(15)
     prev_low_15 = float(recent_15["low"].iloc[:-2].min())
     prev_high_15 = float(recent_15["high"].iloc[:-2].max())
@@ -517,18 +509,15 @@ def evaluate_multi_strategies(ltf, htf, div_info, bos_events, vp_data):
         s2_bull = ema_bull
         s2_status = f"⚖️ انتظار سحب سيولة ({kz_tag})"
 
-    # 3. استراتيجية Parabolic SAR + ADX
     s3_bull = psar_bull
     s3_status = f"🟢 صاعد أعلى SAR (`{psar_val}`) | ADX: `{adx}`" if s3_bull else f"🔴 هابط أسفل SAR (`{psar_val}`) | ADX: `{adx}`"
 
-    # 4. استراتيجية VWAP + Bollinger Squeeze
     avg_bb_width = float(ltf["BB_WIDTH"].tail(40).mean())
     is_squeeze = float(curr["BB_WIDTH"]) < (avg_bb_width * 0.85)
     sq_txt = "⚡ انضغاط انفجاري" if is_squeeze else "تمدد طبيعي"
     s4_bull = vwap_bull and macd_bull
     s4_status = f"🟢 أعلى VWAP (`{vwap_val}`) | {sq_txt}" if vwap_bull else f"🔴 أسفل VWAP (`{vwap_val}`) | {sq_txt}"
 
-    # 5. استراتيجية الفوليوم بروفايل (Volume Profile POC + Value Area)
     s5_bull = poc_bull
     if price > vah_val:
         vp_loc = f"اختراق شرائي أعلى منطقة القيمة VAH (`{vah_val}`)"
@@ -568,7 +557,7 @@ def evaluate_multi_strategies(ltf, htf, div_info, bos_events, vp_data):
         "s5_status": s5_status
     }
 
-# ==================== 5. كشف الدايفرجنس وهيكل السوق و OTE ====================
+# ==================== 5. كشف الدايفرجنس وهيكل السوق و OTE الضيق ====================
 def detect_rsi_macd_divergence(plot_df):
     n = len(plot_df)
     if n < 20: return {"found": False, "text": "حيادي", "rsi_div": None, "macd_div": None}
@@ -623,6 +612,7 @@ def detect_bos_choch(plot_df):
     return events
 
 def analyze_structure_and_ote(df, is_long_bias=True):
+    """استخراج منطقة دخول قناصة وضيقة حول مستوى 70.5% لتقليص وقف الخسارة"""
     recent = df.tail(55).reset_index(drop=True)
     curr_price = float(recent["close"].iloc[-1])
     atr = max(float(recent["ATR"].iloc[-1]), curr_price * 0.001)
@@ -642,17 +632,19 @@ def analyze_structure_and_ote(df, is_long_bias=True):
     bear_ote_705 = round(swing_low + (0.705 * total_range), 2)
     bear_ote_786 = round(swing_low + (0.786 * total_range), 2)
 
-    demand_bottom, demand_top = max(swing_low, bull_ote_786 - (0.2 * atr)), max(swing_low + (0.6 * atr), bull_ote_618)
-    supply_bottom, supply_top = min(swing_high - (0.6 * atr), bear_ote_618), min(swing_high, bear_ote_786 + (0.2 * atr))
+    demand_bottom, demand_top = max(swing_low, bull_ote_786 - (0.2 * atr)), max(swing_low + (0.5 * atr), bull_ote_618)
+    supply_bottom, supply_top = min(swing_high - (0.5 * atr), bear_ote_618), min(swing_high, bear_ote_786 + (0.2 * atr))
 
+    # تضييق منطقة الدخول (Sniper Zone) لتكون بسمك صغير (0.30 * ATR) حول نقطة 0.705
+    half_band = 0.15 * atr
     if is_long_bias:
         ote_zone = (bull_ote_786, bull_ote_618)
         ote_sweet = bull_ote_705
-        sniper_zone = (round(min(demand_bottom, bull_ote_786), 2), round(max(demand_top, bull_ote_618), 2))
+        sniper_zone = (round(ote_sweet - half_band, 2), round(ote_sweet + half_band, 2))
     else:
         ote_zone = (bear_ote_618, bear_ote_786)
         ote_sweet = bear_ote_705
-        sniper_zone = (round(min(supply_bottom, bear_ote_618), 2), round(max(supply_top, bear_ote_786), 2))
+        sniper_zone = (round(ote_sweet - half_band, 2), round(ote_sweet + half_band, 2))
 
     return {
         "bsl": round(swing_high, 2), "ssl": round(swing_low, 2), "eq_50": eq_50,
@@ -672,7 +664,6 @@ def generate_chart_image(df, zones, vp_data, div_info, bos_events, asset_title, 
         fig.patch.set_facecolor("#131722")
         for a in [ax, ax_rsi, ax_macd]: a.set_facecolor("#131722")
 
-        # 1. رسم الأعمدة الأفقية للفوليوم بروفايل (Volume Profile Histogram) على يسار الشارت
         max_v = max(vp_data["bin_volumes"]) if vp_data["bin_volumes"] else 1.0
         for b_i, (b_center, b_vol) in enumerate(zip(vp_data["bin_centers"], vp_data["bin_volumes"])):
             bar_w = (b_vol / max(max_v, 1e-9)) * 14.0
@@ -681,7 +672,6 @@ def generate_chart_image(df, zones, vp_data, div_info, bos_events, asset_title, 
             bar_alpha = 0.55 if is_poc_bar else 0.25
             ax.barh(b_center, bar_w, height=vp_data["bin_height"], left=-1.0, color=bar_col, alpha=bar_alpha, edgecolor=bar_col, zorder=2)
 
-        # 2. رسم خط نقطة التحكم بالحجم (POC) وخطوط منطقة القيمة (VAH / VAL)
         poc_p = vp_data["poc"]
         vah_p = vp_data["vah"]
         val_p = vp_data["val"]
@@ -691,23 +681,20 @@ def generate_chart_image(df, zones, vp_data, div_info, bos_events, asset_title, 
         ax.axhline(poc_p, color="#00e5ff", linestyle="-", linewidth=1.7, alpha=0.95, label=f"POC ({poc_p})", zorder=4)
         ax.axhline(vah_p, color="#00b0ff", linestyle=":", linewidth=0.9, alpha=0.75, zorder=2)
         ax.axhline(val_p, color="#00b0ff", linestyle=":", linewidth=0.9, alpha=0.75, zorder=2)
-        ax.text(x_end + 0.2, poc_p, f" POC (Vol Control): {poc_p}", color="#00e5ff", fontsize=8, va="center", fontweight="bold")
+        ax.text(x_end + 0.2, poc_p, f" POC: {poc_p}", color="#00e5ff", fontsize=8, va="center", fontweight="bold")
 
-        # 3. رسم الشموع اليابانية
         for idx, row in plot_df.iterrows():
             o, h, l, c = float(row["open"]), float(row["high"]), float(row["low"]), float(row["close"])
             color = "#26a69a" if c >= o else "#ef5350"
             ax.plot([idx, idx], [l, h], color=color, linewidth=1.1, zorder=3)
             ax.bar(idx, max(abs(c - o), (h - l) * 0.02, 1e-4), bottom=min(o, c), width=0.62, color=color, edgecolor=color, zorder=4)
 
-        # 4. رسم نقاط Parabolic SAR و خط VWAP المؤسسي
         if "PSAR" in plot_df.columns:
             psar_colors = ["#00e676" if plot_df["close"].iloc[i] >= plot_df["PSAR"].iloc[i] else "#ff5252" for i in range(len(plot_df))]
             ax.scatter(plot_df.index, plot_df["PSAR"], c=psar_colors, s=11, alpha=0.9, label="Parabolic SAR", zorder=5)
         if "VWAP" in plot_df.columns:
             ax.plot(plot_df.index, plot_df["VWAP"], color="#e040fb", linewidth=1.3, linestyle="-.", label="VWAP", zorder=5)
 
-        # 5. رسم مناطق العرض والطلب ومستطيل OTE الذهبي
         d_low, d_high = zones["demand_zone"]
         s_low, s_high = zones["supply_zone"]
         ax.add_patch(patches.Rectangle((0, d_low), width=x_end, height=max(d_high - d_low, 1e-3), facecolor="#00e676", alpha=0.13, edgecolor="#00e676", linewidth=1, zorder=1))
@@ -731,12 +718,11 @@ def generate_chart_image(df, zones, vp_data, div_info, bos_events, asset_title, 
 
         label_x = x_end + 0.2
         ax.text(label_x, e_mid, f" ENTRY: {e_mid}", color="#ffffff", fontsize=8, va="center", fontweight="bold")
-        ax.text(label_x, sl, f" SL: {sl}", color="#ff1744", fontsize=8, va="center", fontweight="bold")
-        ax.text(label_x, tp1, f" TP1: {tp1}", color="#26a69a", fontsize=8, va="center", fontweight="bold")
-        ax.text(label_x, tp2, f" TP2: {tp2}", color="#00e676", fontsize=8, va="center", fontweight="bold")
+        ax.text(label_x, sl, f" TIGHT SL: {sl}", color="#ff1744", fontsize=8, va="center", fontweight="bold")
+        ax.text(label_x, tp1, f" TP1 (1R): {tp1}", color="#26a69a", fontsize=8, va="center", fontweight="bold")
+        ax.text(label_x, tp2, f" TP2 (2R): {tp2}", color="#00e676", fontsize=8, va="center", fontweight="bold")
         ax.legend(loc="upper left", facecolor="#1e222d", edgecolor="#2a2e39", labelcolor="#ffffff", fontsize=7.5)
 
-        # 6. لوحة RSI و MACD
         ax_rsi.plot(plot_df.index, plot_df["RSI"], color="#ab47bc", linewidth=1.3)
         ax_rsi.axhline(70, color="#ef5350", linestyle=":", linewidth=0.8)
         ax_rsi.axhline(30, color="#26a69a", linestyle=":", linewidth=0.8)
@@ -756,7 +742,7 @@ def generate_chart_image(df, zones, vp_data, div_info, bos_events, asset_title, 
             m_d = div_info["macd_div"]
             ax_macd.plot([m_d["x1"], m_d["x2"]], [m_d["v1"], m_d["v2"]], color=m_d["color"], linewidth=2.0, marker="o", markersize=3, zorder=6)
 
-        ax.set_title(f"{asset_title}  |  5-Strategy Engine + Volume Profile (POC: {poc_p})", color="#ffffff", fontsize=10, fontweight="bold", pad=10)
+        ax.set_title(f"{asset_title}  |  Fast Targets (1R / 2R) + Tight SL + POC ({poc_p})", color="#ffffff", fontsize=10, fontweight="bold", pad=10)
         for a in [ax, ax_rsi, ax_macd]:
             a.grid(color="#2a2e39", linestyle="--", linewidth=0.5, alpha=0.6)
             a.tick_params(colors="#b2b5be", labelsize=7.5)
@@ -773,7 +759,7 @@ def generate_chart_image(df, zones, vp_data, div_info, bos_events, asset_title, 
         plt.close("all")
         return None
 
-# ==================== 7. بناء خطة التداول الشاملة بالاستراتيجيات الخمس ====================
+# ==================== 7. بناء خطة التداول بالوقف الضيق والأهداف السريعة (1R و 2R) ====================
 def register_pending_trade(trade_key, asset_name, sym_type, is_long, entry_zone, sl, exit_zone, tf_label):
     with trades_lock:
         old = active_trades.get(trade_key)
@@ -817,38 +803,41 @@ def analyze_and_send_zones(sym_type, ltf_str=None, chat_id=None, silent_register
 
     zones = analyze_structure_and_ote(ltf, is_long)
     entry_zone = zones["sniper_zone"]
-    s_low, s_high = zones["supply_zone"]
-    d_low, d_high = zones["demand_zone"]
-    bsl, ssl, eq_50 = zones["bsl"], zones["ssl"], zones["eq_50"]
     poc_p = vp_data["poc"]
 
     l_curr = ltf.iloc[-1]
     curr_price = round(float(l_curr["close"]), 2)
     atr = max(float(l_curr["ATR"]), curr_price * 0.001)
 
+    # المعادلات الجديدة: وقف خسارة ضيق (0.20 * ATR خلف المنطقة) وأهداف سريعة (1R و 2R)
     if is_long:
-        dir_label = "شراء معلق (BUY LIMIT) 🟢"
+        dir_label = "شراء معلق سريع (BUY LIMIT — 1R/2R) 🟢"
         entry_mid = round((entry_zone[0] + entry_zone[1]) / 2, 2)
-        sl = round(min(d_low, ssl, entry_zone[0]) - (0.4 * atr), 2)
-        risk = max(entry_mid - sl, 0.5 * atr)
-        tp1_target = max(eq_50, poc_p) if poc_p > entry_mid else eq_50
-        exit_zone = (round(max(tp1_target, entry_mid + (1.6 * risk)), 2), round(max(bsl, entry_mid + (3.2 * risk)), 2))
+        raw_sl = entry_zone[0] - (0.20 * atr)
+        risk = min(max(entry_mid - raw_sl, 0.30 * atr), 0.85 * atr)
+        sl = round(entry_mid - risk, 2)
+        tp1 = round(entry_mid + (1.0 * risk), 2)
+        tp2 = round(entry_mid + (2.0 * risk), 2)
+        exit_zone = (tp1, tp2)
     else:
-        dir_label = "بيع معلق (SELL LIMIT) 🔴"
+        dir_label = "بيع معلق سريع (SELL LIMIT — 1R/2R) 🔴"
         entry_mid = round((entry_zone[0] + entry_zone[1]) / 2, 2)
-        sl = round(max(s_high, bsl, entry_zone[1]) + (0.4 * atr), 2)
-        risk = max(sl - entry_mid, 0.5 * atr)
-        tp1_target = min(eq_50, poc_p) if poc_p < entry_mid else eq_50
-        exit_zone = (round(min(tp1_target, entry_mid - (1.6 * risk)), 2), round(min(ssl, entry_mid - (3.2 * risk)), 2))
+        raw_sl = entry_zone[1] + (0.20 * atr)
+        risk = min(max(raw_sl - entry_mid, 0.30 * atr), 0.85 * atr)
+        sl = round(entry_mid + risk, 2)
+        tp1 = round(entry_mid - (1.0 * risk), 2)
+        tp2 = round(entry_mid - (2.0 * risk), 2)
+        exit_zone = (tp1, tp2)
 
     register_pending_trade(f"{sym_type}_{ltf_use}", asset_name, sym_type, is_long, entry_zone, sl, exit_zone, ltf_use)
     if silent_register_only:
         return
 
+    risk_pts = round(abs(entry_mid - sl), 2)
     caption = (
-        f"🧠 *تقرير محرك الاستراتيجيات الخمس (5-in-1 Engine):*\n"
+        f"⚡ *تقرير القناص السريع (5-in-1 Engine | 1R & 2R):*\n"
         f"📊 *الأصل:* `{asset_name}` | *الفريم:* `{ltf_use}` (الأكبر `{htf_use}`)\n"
-        f"💵 *السعر الحالي:* `{curr_price}` | *توافق الاستراتيجيات:* `{strat_matrix['aligned_count']}/5` (`{strat_matrix['confidence']}%`)\n"
+        f"💵 *السعر الحالي:* `{curr_price}` | *التوافق:* `{strat_matrix['aligned_count']}/5` (`{strat_matrix['confidence']}%`)\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📋 *مصفوفة الاستراتيجيات الخمس:*\n"
         f"1️⃣ *SMC + OTE:* {strat_matrix['s1_status']}\n"
@@ -859,10 +848,11 @@ def analyze_and_send_zones(sym_type, ltf_str=None, chat_id=None, silent_register
         f"🧬 *الدايفرجنس (RSI/MACD):* {div_info['text']}\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📌 *القرار الموحد:* {dir_label}\n"
-        f"🏛 *نقطة التحكم بالسيولة (POC):* `{poc_p}` (منطقة القيمة: `{vp_data['val']} - {vp_data['vah']}`)\n"
-        f"🎯 *منطقة الدخول الذهبية (OTE):* `{entry_zone[0]}` إلى `{entry_zone[1]}`\n"
-        f"🛑 *وقف الخسارة الهيكلي (SL):* `{sl}`\n"
-        f"✅ *الهدف الأول (TP1):* `{exit_zone[0]}` | *الهدف الثاني (TP2):* `{exit_zone[1]}`"
+        f"🏛 *ارتكاز السيولة (POC):* `{poc_p}`\n"
+        f"🎯 *منطقة الدخول القناصة:* `{entry_zone[0]}` إلى `{entry_zone[1]}` (المنتصف: `{entry_mid}`)\n"
+        f"🛑 *وقف الخسارة الضيق (SL - 1R):* `{sl}` (المخاطرة: `{risk_pts}`)\n"
+        f"✅ *الهدف السريع الأول (TP1 = 1R):* `{exit_zone[0]}`\n"
+        f"🚀 *الهدف السريع الثاني (TP2 = 2R):* `{exit_zone[1]}`"
     )
     chart_buf = generate_chart_image(ltf, zones, vp_data, div_info, bos_events, f"{chart_code} ({ltf_use})", entry_zone, sl, exit_zone, is_long)
     send_photo_msg(chart_buf, caption, sym_type, chat_id)
@@ -916,29 +906,29 @@ def trade_tracker_loop():
 
                     if t["is_long"]:
                         if high_p >= t["tp2"]:
-                            send_arabic_voice_alert(f"مبروك، حقق سعر {arabic_name} الهدف الثاني بالكامل.", f"🚀 *مبروك! تحقق الهدف الثاني TP2 للأصل {t['asset']}!*")
+                            send_arabic_voice_alert(f"مبروك، حقق سعر {arabic_name} الهدف الثاني السريع بالكامل.", f"🚀 *مبروك! تحقق الهدف الثاني السريع (2R: {t['tp2']}) للأصل {t['asset']}!*")
                             with trades_lock: active_trades.pop(k, None)
                         elif (not t["tp1_hit"]) and high_p >= t["tp1"]:
                             with trades_lock:
                                 if k in active_trades:
                                     active_trades[k]["tp1_hit"] = True
                                     active_trades[k]["sl"] = t["entry_mid"]
-                            send_arabic_voice_alert(f"مبروك، وصل سعر {arabic_name} إلى الهدف الأول وتم تأمين الصفقة.", f"✅ *تحقق الهدف الأول TP1 وتأمين الستوب دخول لـ {t['asset']}!*")
+                            send_arabic_voice_alert(f"مبروك، وصل سعر {arabic_name} إلى الهدف الأول السريع وتم تأمين الصفقة.", f"✅ *تحقق الهدف الأول السريع (1R: {t['tp1']}) وتأمين الستوب دخول لـ {t['asset']}!*")
                         elif low_p <= t["sl"]:
-                            broadcast_msg(f"🛑 *تم ضرب وقف الخسارة لـ {t['asset']}.*")
+                            broadcast_msg(f"🛑 *تم ضرب وقف الخسارة الضيق لـ {t['asset']}.*")
                             with trades_lock: active_trades.pop(k, None)
                     else:
                         if low_p <= t["tp2"]:
-                            send_arabic_voice_alert(f"مبروك، حقق سعر {arabic_name} الهدف الثاني بالكامل.", f"🚀 *مبروك! تحقق الهدف الثاني TP2 للأصل {t['asset']}!*")
+                            send_arabic_voice_alert(f"مبروك، حقق سعر {arabic_name} الهدف الثاني السريع بالكامل.", f"🚀 *مبروك! تحقق الهدف الثاني السريع (2R: {t['tp2']}) للأصل {t['asset']}!*")
                             with trades_lock: active_trades.pop(k, None)
                         elif (not t["tp1_hit"]) and low_p <= t["tp1"]:
                             with trades_lock:
                                 if k in active_trades:
                                     active_trades[k]["tp1_hit"] = True
                                     active_trades[k]["sl"] = t["entry_mid"]
-                            send_arabic_voice_alert(f"مبروك، وصل سعر {arabic_name} إلى الهدف الأول وتم تأمين الصفقة.", f"✅ *تحقق الهدف الأول TP1 وتأمين الستوب دخول لـ {t['asset']}!*")
+                            send_arabic_voice_alert(f"مبروك، وصل سعر {arabic_name} إلى الهدف الأول السريع وتم تأمين الصفقة.", f"✅ *تحقق الهدف الأول السريع (1R: {t['tp1']}) وتأمين الستوب دخول لـ {t['asset']}!*")
                         elif high_p >= t["sl"]:
-                            broadcast_msg(f"🛑 *تم ضرب وقف الخسارة لـ {t['asset']}.*")
+                            broadcast_msg(f"🛑 *تم ضرب وقف الخسارة الضيق لـ {t['asset']}.*")
                             with trades_lock: active_trades.pop(k, None)
         except Exception as e:
             print(f"Tracker error: {e}")
@@ -1000,10 +990,10 @@ def format_active_trades_report():
     with trades_lock:
         if not active_trades: return "📂 *لا توجد صفقات نشطة حالياً.*"
         snap = dict(active_trades)
-    lines = ["📂 *المناطق المراقبة تلقائياً بالناطق العربي:*\n━━━━━━━━━━━━━━━━━━"]
+    lines = ["📂 *المناطق المراقبة تلقائياً (أهداف سريعة 1R / 2R):*\n━━━━━━━━━━━━━━━━━━"]
     for k, t in snap.items():
         st = "⏳ بانتظار الملامسة" if t["status"] == "PENDING" else "🔥 مفعل بالسوق"
-        lines.append(f"🔹 *{t['asset']}* ({t['tf']}) | {st}\n   منطقة OTE: `{t['entry_low']} - {t['entry_high']}` | SL: `{t['sl']}`")
+        lines.append(f"🔹 *{t['asset']}* ({t['tf']}) | {st}\n   الدخول: `{t['entry_low']} - {t['entry_high']}` | SL: `{t['sl']}` | TP1: `{t['tp1']}` | TP2: `{t['tp2']}`")
     return "\n".join(lines)
 
 def telegram_listener():
@@ -1143,9 +1133,9 @@ def telegram_listener():
                                 continue
 
                         if text in ["/start", "/help"]:
-                            send_msg("🤖 *أهلاً بك في محرك الاستراتيجيات الخمس (SMC + ICT + PSAR + VWAP + Volume Profile POC)!*", chat_id)
+                            send_msg("🤖 *أهلاً بك في نظام الأهداف السريعة (1R / 2R) والوقف الضيق!*", chat_id)
                         elif text in ["🔊 تجربة الناطق العربي", "/sound"]:
-                            test_speech = "أهلاً بك، محرك الفوليوم بروفايل والاستراتيجيات الخمس يعمل بنجاح."
+                            test_speech = "أهلاً بك، تم ضبط البوت على وقف الخسارة الضيق والأهداف السريعة واحد آر واثنين آر."
                             send_arabic_voice_alert(test_speech, "🗣️ *تجربة الناطق الصوتي باللغة العربية*", chat_id)
                         elif text in ["⚡ فريم سكالب (5m)", "/scalp"]:
                             user_settings.update({"mode_name": TIMEFRAME_MODES["scalp"]["name"], "ltf": "5m", "htf": "15m"})
@@ -1174,7 +1164,7 @@ def telegram_listener():
 
 @app.route("/")
 def home():
-    return "5-Strategy Institutional + Volume Profile POC Bot is Live 24/7!"
+    return "Fast 1R/2R + Tight SL Institutional Bot is Live 24/7!"
 
 @app.route("/health")
 def health():
@@ -1206,8 +1196,9 @@ if __name__ == "__main__":
     threading.Thread(target=trade_tracker_loop, daemon=True).start()
     threading.Thread(target=keep_alive_pinger, daemon=True).start()
     send_msg(
-        "🏛 *تم إضافة الفوليوم بروفايل (Volume Profile POC + Value Area) بنجاح!*\n"
-        "• سيظهر الآن على يسار الشارت توزيع السيولة الأفقي مع خط الارتكاز المؤسسي **`POC`** باللون السماوي الساطع."
+        "⚡ *تم تعديل المعادلات إلى نظام الوقف الضيق والأهداف السريعة (`1R` و `2R`) بنجاح!*\n"
+        "• وقف الخسارة أصبح يوضع مباشرة خلف منطقة الدخول القناصة (`70.5%`).\n"
+        "• الهدف الأول (`TP1`) أصبح على بُعد `1R` لتأمين الصفقة بسرعة، والهدف الثاني (`TP2`) عند `2R`."
     )
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)

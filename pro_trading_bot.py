@@ -37,7 +37,7 @@ trades_lock = threading.Lock()
 
 # ==================== نظام الحفظ الدائم (Persistent Storage) ====================
 USERS_FILE = "users_store.json"
-users_lock = threading.RLock()  # RLock لمنع التجمّد عند استدعاء الحفظ داخل القفل
+users_lock = threading.RLock()
 
 def load_users_from_disk():
     default_db = {
@@ -84,10 +84,34 @@ def save_users_to_disk():
 
 users_db = load_users_from_disk()
 
+# ==================== إعدادات الفريمات ونظام الأرباح بالدولار (TP1 / TP2 / TP3) ====================
+PROFIT_PROFILES = {
+    "scalp": {
+        "label": "سكالبينج سريع ($5 / $10 / $20) ⚡",
+        "tp1_usd": 5.0,
+        "tp2_usd": 10.0,
+        "tp3_usd": 20.0,
+        "sl_usd": 5.0
+    },
+    "swing": {
+        "label": "سوينق بعيد ($15 / $30 / $60) 🌊",
+        "tp1_usd": 15.0,
+        "tp2_usd": 30.0,
+        "tp3_usd": 60.0,
+        "sl_usd": 12.0
+    }
+}
+
 user_settings = {
     "mode_name": "مضاربة متوسطة (15m / 4h)",
     "ltf": "15m",
-    "htf": "4h"
+    "htf": "4h",
+    "profit_style": "scalp",
+    "lot_size": 0.01,       # حجم اللوت الافتراضي لحساب مسافة الدولارات
+    "tp1_usd": 5.0,         # الهدف الأول بالدولار
+    "tp2_usd": 10.0,        # الهدف الثاني بالدولار
+    "tp3_usd": 20.0,        # الهدف الثالث بالدولار
+    "sl_usd": 5.0           # وقف الخسارة بالدولار
 }
 
 TIMEFRAME_MODES = {
@@ -100,13 +124,26 @@ HTF_MAP = {
     "1m": "15m", "5m": "15m", "15m": "4h", "1h": "4h", "4h": "1d", "1d": "1d"
 }
 
+def usd_to_price_distance(sym_type, usd_amount, lot_size):
+    """
+    تحويل الربح المطلوب بالدولار إلى مسافة سعرية على الشارت:
+    - في الذهب (XAUUSD): عقد 1.00 لوت = 100 أونصة (أي عند لوت 0.01 كل 1 دولار حركة في السعر = 1 دولار ربح).
+    - في البيتكوين (BTCUSD): عقد 0.01 لوت = 0.01 عملة (أي كل 100 دولار حركة في السعر = 1 دولار ربح).
+    """
+    safe_lot = max(float(lot_size), 0.001)
+    if sym_type == "GOLD":
+        return round(float(usd_amount) / (safe_lot * 100.0), 2)
+    else:
+        return round(float(usd_amount) / safe_lot, 2)
+
 app = Flask(__name__)
 
 USER_KEYBOARD = {
     "keyboard": [
         [{"text": "🪙 مناطق دخول الذهب"}, {"text": "₿ مناطق دخول البيتكوين"}],
+        [{"text": "🎯 ربح سكالب ($5/$10/$20)"}, {"text": "🌊 ربح سوينق بعيد ($15/$30/$60)"}],
         [{"text": "⚡ فريم سكالب (5m)"}, {"text": "⏱ فريم متوسط (15m)"}, {"text": "🌊 فريم طويل (4h/1d)"}],
-        [{"text": "📊 فحص شامل بالسوق"}, {"text": "📂 الأوامر المعلقة والنشطة"}],
+        [{"text": "📊 فحص شامل بالسوق"}, {"text": "📂 الأوامر المعلقة والنشطة"}, {"text": "⚙️ إعدادات الربح واللوت"}],
         [{"text": "🔊 تجربة الناطق العربي"}]
     ],
     "resize_keyboard": True,
@@ -116,8 +153,9 @@ USER_KEYBOARD = {
 ADMIN_KEYBOARD = {
     "keyboard": [
         [{"text": "🪙 مناطق دخول الذهب"}, {"text": "₿ مناطق دخول البيتكوين"}],
+        [{"text": "🎯 ربح سكالب ($5/$10/$20)"}, {"text": "🌊 ربح سوينق بعيد ($15/$30/$60)"}],
         [{"text": "⚡ فريم سكالب (5m)"}, {"text": "⏱ فريم متوسط (15m)"}, {"text": "🌊 فريم طويل (4h/1d)"}],
-        [{"text": "📊 فحص شامل بالسوق"}, {"text": "📂 الأوامر المعلقة والنشطة"}],
+        [{"text": "📊 فحص شامل بالسوق"}, {"text": "📂 الأوامر المعلقة والنشطة"}, {"text": "⚙️ إعدادات الربح واللوت"}],
         [{"text": "🔐 لوحة تحكم المشرف"}, {"text": "🔊 تجربة الناطق العربي"}, {"text": "🗑️ مسح الصفقات"}]
     ],
     "resize_keyboard": True,
@@ -199,6 +237,10 @@ def get_inline_tf_buttons(sym_type):
                 {"text": "🕐 1h", "callback_data": f"TF|{sym_type}|1h"},
                 {"text": "🕓 4h", "callback_data": f"TF|{sym_type}|4h"},
                 {"text": "📅 1d يومي", "callback_data": f"TF|{sym_type}|1d"}
+            ],
+            [
+                {"text": "🎯 أهداف سكالب ($5/$10/$20)", "callback_data": f"PMODE|{sym_type}|scalp"},
+                {"text": "🌊 أهداف سوينق ($15/$30/$60)", "callback_data": f"PMODE|{sym_type}|swing"}
             ]
         ]
     }
@@ -708,13 +750,13 @@ def analyze_structure_and_ote(df, is_long_bias=True):
         "supply_zone": (round(supply_bottom, 2), round(supply_top, 2))
     }
 
-# ==================== 6. رسم الشارت المتكامل ====================
-def generate_chart_image(df, zones, vp_data, div_info, bos_events, asset_title, entry_zone, sl, exit_zone, is_long=True):
+# ==================== 6. رسم الشارت المتكامل مع TP1 و TP2 و TP3 بالدولار ====================
+def generate_chart_image(df, zones, vp_data, div_info, bos_events, asset_title, entry_zone, sl, exit_targets, usd_targets, is_long=True):
     try:
         plot_df = df.tail(55).reset_index(drop=True)
         fig, (ax, ax_rsi, ax_macd) = plt.subplots(
-            3, 1, figsize=(10.8, 9.2), dpi=115, sharex=True,
-            gridspec_kw={"height_ratios": [3.4, 1.0, 1.0], "hspace": 0.08}
+            3, 1, figsize=(10.8, 9.4), dpi=115, sharex=True,
+            gridspec_kw={"height_ratios": [3.5, 1.0, 1.0], "hspace": 0.08}
         )
         fig.patch.set_facecolor("#131722")
         for a in [ax, ax_rsi, ax_macd]:
@@ -732,7 +774,7 @@ def generate_chart_image(df, zones, vp_data, div_info, bos_events, asset_title, 
         vah_p = vp_data["vah"]
         val_p = vp_data["val"]
         x_end = len(plot_df) + 4
-        ax.set_xlim(-1.2, x_end + 8)
+        ax.set_xlim(-1.2, x_end + 9)
 
         ax.axhline(poc_p, color="#00e5ff", linestyle="-", linewidth=1.7, alpha=0.95, label=f"POC ({poc_p})", zorder=4)
         ax.axhline(vah_p, color="#00b0ff", linestyle=":", linewidth=0.9, alpha=0.75, zorder=2)
@@ -766,17 +808,21 @@ def generate_chart_image(df, zones, vp_data, div_info, bos_events, asset_title, 
             ax.text(len(plot_df) - 12, ev["level"], f" {ev['text']}", color=ev["color"], fontsize=7.5, va="bottom", fontweight="bold")
 
         e_mid = round((entry_zone[0] + entry_zone[1]) / 2, 2)
-        tp1, tp2 = exit_zone
+        tp1, tp2, tp3 = exit_targets
+        u1, u2, u3, u_sl = usd_targets
+
         ax.axhline(e_mid, color="#ffffff", linestyle="--", linewidth=1.2, alpha=0.95)
         ax.axhline(sl, color="#ff1744", linestyle="-", linewidth=1.3, alpha=0.95)
         ax.axhline(tp1, color="#26a69a", linestyle="--", linewidth=1.1, alpha=0.9)
-        ax.axhline(tp2, color="#00e676", linestyle="-", linewidth=1.3, alpha=0.95)
+        ax.axhline(tp2, color="#00e676", linestyle="--", linewidth=1.2, alpha=0.95)
+        ax.axhline(tp3, color="#69f0ae", linestyle="-", linewidth=1.4, alpha=0.98)
 
         label_x = x_end + 0.2
-        ax.text(label_x, e_mid, f" ENTRY: {e_mid}", color="#ffffff", fontsize=8, va="center", fontweight="bold")
-        ax.text(label_x, sl, f" TIGHT SL: {sl}", color="#ff1744", fontsize=8, va="center", fontweight="bold")
-        ax.text(label_x, tp1, f" TP1 (1R): {tp1}", color="#26a69a", fontsize=8, va="center", fontweight="bold")
-        ax.text(label_x, tp2, f" TP2 (2R): {tp2}", color="#00e676", fontsize=8, va="center", fontweight="bold")
+        ax.text(label_x, e_mid, f" ENTRY: {e_mid}", color="#ffffff", fontsize=7.8, va="center", fontweight="bold")
+        ax.text(label_x, sl, f" SL (-${u_sl}): {sl}", color="#ff1744", fontsize=7.8, va="center", fontweight="bold")
+        ax.text(label_x, tp1, f" TP1 (+${u1}): {tp1}", color="#26a69a", fontsize=7.8, va="center", fontweight="bold")
+        ax.text(label_x, tp2, f" TP2 (+${u2}): {tp2}", color="#00e676", fontsize=7.8, va="center", fontweight="bold")
+        ax.text(label_x, tp3, f" TP3 (+${u3}): {tp3}", color="#69f0ae", fontsize=7.8, va="center", fontweight="bold")
         ax.legend(loc="upper left", facecolor="#1e222d", edgecolor="#2a2e39", labelcolor="#ffffff", fontsize=7.5)
 
         ax_rsi.plot(plot_df.index, plot_df["RSI"], color="#ab47bc", linewidth=1.3)
@@ -798,7 +844,7 @@ def generate_chart_image(df, zones, vp_data, div_info, bos_events, asset_title, 
             m_d = div_info["macd_div"]
             ax_macd.plot([m_d["x1"], m_d["x2"]], [m_d["v1"], m_d["v2"]], color=m_d["color"], linewidth=2.0, marker="o", markersize=3, zorder=6)
 
-        ax.set_title(f"{asset_title}  |  Fast Targets (1R / 2R) + Tight SL + POC ({poc_p})", color="#ffffff", fontsize=10, fontweight="bold", pad=10)
+        ax.set_title(f"{asset_title} | Targets: +${u1} / +${u2} / +${u3} (Lot: {user_settings['lot_size']}) | POC: {poc_p}", color="#ffffff", fontsize=9.5, fontweight="bold", pad=10)
         for a in [ax, ax_rsi, ax_macd]:
             a.grid(color="#2a2e39", linestyle="--", linewidth=0.5, alpha=0.6)
             a.tick_params(colors="#b2b5be", labelsize=7.5)
@@ -816,8 +862,8 @@ def generate_chart_image(df, zones, vp_data, div_info, bos_events, asset_title, 
         plt.close("all")
         return None
 
-# ==================== 7. بناء خطة التداول بالوقف الضيق والأهداف السريعة (1R و 2R) ====================
-def register_pending_trade(trade_key, asset_name, sym_type, is_long, entry_zone, sl, exit_zone, tf_label):
+# ==================== 7. بناء خطة التداول بالأهداف الثلاثة بالدولار ($5 / $10 / $20) ====================
+def register_pending_trade(trade_key, asset_name, sym_type, is_long, entry_zone, sl, exit_targets, usd_targets, tf_label):
     with trades_lock:
         old = active_trades.get(trade_key)
         already_sent = old.get("voice_alert_sent", False) if (old and abs(old["entry_low"] - float(entry_zone[0])) < 0.5) else False
@@ -825,8 +871,19 @@ def register_pending_trade(trade_key, asset_name, sym_type, is_long, entry_zone,
             "asset": asset_name, "symbol_type": sym_type, "is_long": is_long,
             "entry_low": float(entry_zone[0]), "entry_high": float(entry_zone[1]),
             "entry_mid": round((entry_zone[0] + entry_zone[1]) / 2, 2),
-            "sl": float(sl), "tp1": float(exit_zone[0]), "tp2": float(exit_zone[1]),
-            "status": "PENDING", "voice_alert_sent": already_sent, "tp1_hit": False, "tf": tf_label,
+            "sl": float(sl),
+            "tp1": float(exit_targets[0]),
+            "tp2": float(exit_targets[1]),
+            "tp3": float(exit_targets[2]),
+            "tp1_usd": usd_targets[0],
+            "tp2_usd": usd_targets[1],
+            "tp3_usd": usd_targets[2],
+            "sl_usd": usd_targets[3],
+            "status": "PENDING",
+            "voice_alert_sent": already_sent,
+            "tp1_hit": False,
+            "tp2_hit": False,
+            "tf": tf_label,
             "created_at": time.strftime("%H:%M UTC", time.gmtime())
         }
 
@@ -864,36 +921,47 @@ def analyze_and_send_zones(sym_type, ltf_str=None, chat_id=None, silent_register
 
     l_curr = ltf.iloc[-1]
     curr_price = round(float(l_curr["close"]), 2)
-    atr = max(float(l_curr["ATR"]), curr_price * 0.001)
+
+    lot = user_settings["lot_size"]
+    u_tp1 = user_settings["tp1_usd"]
+    u_tp2 = user_settings["tp2_usd"]
+    u_tp3 = user_settings["tp3_usd"]
+    u_sl = user_settings["sl_usd"]
+
+    dist_tp1 = usd_to_price_distance(sym_type, u_tp1, lot)
+    dist_tp2 = usd_to_price_distance(sym_type, u_tp2, lot)
+    dist_tp3 = usd_to_price_distance(sym_type, u_tp3, lot)
+    dist_sl = usd_to_price_distance(sym_type, u_sl, lot)
+
+    entry_mid = round((entry_zone[0] + entry_zone[1]) / 2, 2)
 
     if is_long:
-        dir_label = "شراء معلق سريع (BUY LIMIT — 1R/2R) 🟢"
-        entry_mid = round((entry_zone[0] + entry_zone[1]) / 2, 2)
-        raw_sl = entry_zone[0] - (0.20 * atr)
-        risk = min(max(entry_mid - raw_sl, 0.30 * atr), 0.85 * atr)
-        sl = round(entry_mid - risk, 2)
-        tp1 = round(entry_mid + (1.0 * risk), 2)
-        tp2 = round(entry_mid + (2.0 * risk), 2)
-        exit_zone = (tp1, tp2)
+        dir_label = "شراء معلق (BUY LIMIT) 🟢"
+        sl = round(entry_mid - dist_sl, 2)
+        tp1 = round(entry_mid + dist_tp1, 2)
+        tp2 = round(entry_mid + dist_tp2, 2)
+        tp3 = round(entry_mid + dist_tp3, 2)
     else:
-        dir_label = "بيع معلق سريع (SELL LIMIT — 1R/2R) 🔴"
-        entry_mid = round((entry_zone[0] + entry_zone[1]) / 2, 2)
-        raw_sl = entry_zone[1] + (0.20 * atr)
-        risk = min(max(raw_sl - entry_mid, 0.30 * atr), 0.85 * atr)
-        sl = round(entry_mid + risk, 2)
-        tp1 = round(entry_mid - (1.0 * risk), 2)
-        tp2 = round(entry_mid - (2.0 * risk), 2)
-        exit_zone = (tp1, tp2)
+        dir_label = "بيع معلق (SELL LIMIT) 🔴"
+        sl = round(entry_mid + dist_sl, 2)
+        tp1 = round(entry_mid - dist_tp1, 2)
+        tp2 = round(entry_mid - dist_tp2, 2)
+        tp3 = round(entry_mid - dist_tp3, 2)
 
-    register_pending_trade(f"{sym_type}_{ltf_use}", asset_name, sym_type, is_long, entry_zone, sl, exit_zone, ltf_use)
+    exit_targets = (tp1, tp2, tp3)
+    usd_targets = (u_tp1, u_tp2, u_tp3, u_sl)
+
+    register_pending_trade(f"{sym_type}_{ltf_use}", asset_name, sym_type, is_long, entry_zone, sl, exit_targets, usd_targets, ltf_use)
     if silent_register_only:
         return
 
-    risk_pts = round(abs(entry_mid - sl), 2)
+    style_name = "سكالبينج سريع ⚡" if user_settings["profit_style"] == "scalp" else ("سوينق بعيد 🌊" if user_settings["profit_style"] == "swing" else "مخصص ⚙️")
+
     caption = (
-        f"⚡ *تقرير القناص السريع (5-in-1 Engine | 1R & 2R):*\n"
+        f"⚡ *تقرير القناص الاحترافي (أهداف بالدولار TP1 / TP2 / TP3):*\n"
         f"📊 *الأصل:* `{asset_name}` | *الفريم:* `{ltf_use}` (الأكبر `{htf_use}`)\n"
         f"💵 *السعر الحالي:* `{curr_price}` | *التوافق:* `{strat_matrix['aligned_count']}/5` (`{strat_matrix['confidence']}%`)\n"
+        f"💼 *نمط الربح:* `{style_name}` | *حجم اللوت:* `{lot}`\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📋 *مصفوفة الاستراتيجيات الخمس:*\n"
         f"1️⃣ *SMC + OTE:* {strat_matrix['s1_status']}\n"
@@ -906,11 +974,12 @@ def analyze_and_send_zones(sym_type, ltf_str=None, chat_id=None, silent_register
         f"📌 *القرار الموحد:* {dir_label}\n"
         f"🏛 *ارتكاز السيولة (POC):* `{poc_p}`\n"
         f"🎯 *منطقة الدخول القناصة:* `{entry_zone[0]}` إلى `{entry_zone[1]}` (المنتصف: `{entry_mid}`)\n"
-        f"🛑 *وقف الخسارة الضيق (SL - 1R):* `{sl}` (المخاطرة: `{risk_pts}`)\n"
-        f"✅ *الهدف السريع الأول (TP1 = 1R):* `{exit_zone[0]}`\n"
-        f"🚀 *الهدف السريع الثاني (TP2 = 2R):* `{exit_zone[1]}`"
+        f"🛑 *وقف الخسارة (SL = -${u_sl}):* `{sl}`\n"
+        f"✅ *الهدف الأول (TP1 = +${u_tp1}):* `{tp1}`\n"
+        f"🔥 *الهدف الثاني (TP2 = +${u_tp2}):* `{tp2}`\n"
+        f"🚀 *الهدف الثالث (TP3 = +${u_tp3}):* `{tp3}`"
     )
-    chart_buf = generate_chart_image(ltf, zones, vp_data, div_info, bos_events, f"{chart_code} ({ltf_use})", entry_zone, sl, exit_zone, is_long)
+    chart_buf = generate_chart_image(ltf, zones, vp_data, div_info, bos_events, f"{chart_code} ({ltf_use})", entry_zone, sl, exit_targets, usd_targets, is_long)
     send_photo_msg(chart_buf, caption, sym_type, chat_id)
 
 def auto_zone_scanner_loop():
@@ -969,40 +1038,94 @@ def trade_tracker_loop():
                         continue
 
                     if t["is_long"]:
-                        if high_p >= t["tp2"]:
-                            send_arabic_voice_alert(f"مبروك، حقق سعر {arabic_name} الهدف الثاني السريع بالكامل.", f"🚀 *مبروك! تحقق الهدف الثاني السريع (2R: {t['tp2']}) للأصل {t['asset']}!*")
+                        if high_p >= t["tp3"]:
+                            send_arabic_voice_alert(
+                                f"مبروك، حقق سعر {arabic_name} الهدف الثالث بالكامل بربح {int(t['tp3_usd'])} دولار.",
+                                f"🚀 *مبروك! تحقق الهدف الثالث الكامل (TP3: {t['tp3']} | +${t['tp3_usd']}) للأصل {t['asset']}!*"
+                            )
                             with trades_lock:
                                 active_trades.pop(k, None)
-                        elif (not t["tp1_hit"]) and high_p >= t["tp1"]:
+                        elif (not t.get("tp2_hit", False)) and high_p >= t["tp2"]:
+                            with trades_lock:
+                                if k in active_trades:
+                                    active_trades[k]["tp2_hit"] = True
+                                    active_trades[k]["tp1_hit"] = True
+                                    active_trades[k]["sl"] = t["tp1"]
+                            send_arabic_voice_alert(
+                                f"مبروك، وصل سعر {arabic_name} إلى الهدف الثاني بربح {int(t['tp2_usd'])} دولار وتم رفع الوقف إلى الهدف الأول.",
+                                f"🔥 *تحقق الهدف الثاني (TP2: {t['tp2']} | +${t['tp2_usd']}) لـ {t['asset']} وتم حجز ربح الهدف الأول!*"
+                            )
+                        elif (not t.get("tp1_hit", False)) and high_p >= t["tp1"]:
                             with trades_lock:
                                 if k in active_trades:
                                     active_trades[k]["tp1_hit"] = True
                                     active_trades[k]["sl"] = t["entry_mid"]
-                            send_arabic_voice_alert(f"مبروك، وصل سعر {arabic_name} إلى الهدف الأول السريع وتم تأمين الصفقة.", f"✅ *تحقق الهدف الأول السريع (1R: {t['tp1']}) وتأمين الستوب دخول لـ {t['asset']}!*")
+                            send_arabic_voice_alert(
+                                f"مبروك، وصل سعر {arabic_name} إلى الهدف الأول بربح {int(t['tp1_usd'])} دولار وتم تأمين الصفقة على الدخول.",
+                                f"✅ *تحقق الهدف الأول (TP1: {t['tp1']} | +${t['tp1_usd']}) وتأمين الستوب على الدخول لـ {t['asset']}!*"
+                            )
                         elif low_p <= t["sl"]:
-                            broadcast_msg(f"🛑 *تم ضرب وقف الخسارة الضيق لـ {t['asset']}.*")
+                            broadcast_msg(f"🛑 *تم ضرب مستوى الوقف ({t['sl']}) لـ {t['asset']}.*")
                             with trades_lock:
                                 active_trades.pop(k, None)
                     else:
-                        if low_p <= t["tp2"]:
-                            send_arabic_voice_alert(f"مبروك، حقق سعر {arabic_name} الهدف الثاني السريع بالكامل.", f"🚀 *مبروك! تحقق الهدف الثاني السريع (2R: {t['tp2']}) للأصل {t['asset']}!*")
+                        if low_p <= t["tp3"]:
+                            send_arabic_voice_alert(
+                                f"مبروك، حقق سعر {arabic_name} الهدف الثالث بالكامل بربح {int(t['tp3_usd'])} دولار.",
+                                f"🚀 *مبروك! تحقق الهدف الثالث الكامل (TP3: {t['tp3']} | +${t['tp3_usd']}) للأصل {t['asset']}!*"
+                            )
                             with trades_lock:
                                 active_trades.pop(k, None)
-                        elif (not t["tp1_hit"]) and low_p <= t["tp1"]:
+                        elif (not t.get("tp2_hit", False)) and low_p <= t["tp2"]:
+                            with trades_lock:
+                                if k in active_trades:
+                                    active_trades[k]["tp2_hit"] = True
+                                    active_trades[k]["tp1_hit"] = True
+                                    active_trades[k]["sl"] = t["tp1"]
+                            send_arabic_voice_alert(
+                                f"مبروك، وصل سعر {arabic_name} إلى الهدف الثاني بربح {int(t['tp2_usd'])} دولار وتم رفع الوقف إلى الهدف الأول.",
+                                f"🔥 *تحقق الهدف الثاني (TP2: {t['tp2']} | +${t['tp2_usd']}) لـ {t['asset']} وتم حجز ربح الهدف الأول!*"
+                            )
+                        elif (not t.get("tp1_hit", False)) and low_p <= t["tp1"]:
                             with trades_lock:
                                 if k in active_trades:
                                     active_trades[k]["tp1_hit"] = True
                                     active_trades[k]["sl"] = t["entry_mid"]
-                            send_arabic_voice_alert(f"مبروك، وصل سعر {arabic_name} إلى الهدف الأول السريع وتم تأمين الصفقة.", f"✅ *تحقق الهدف الأول السريع (1R: {t['tp1']}) وتأمين الستوب دخول لـ {t['asset']}!*")
+                            send_arabic_voice_alert(
+                                f"مبروك، وصل سعر {arabic_name} إلى الهدف الأول بربح {int(t['tp1_usd'])} دولار وتم تأمين الصفقة على الدخول.",
+                                f"✅ *تحقق الهدف الأول (TP1: {t['tp1']} | +${t['tp1_usd']}) وتأمين الستوب على الدخول لـ {t['asset']}!*"
+                            )
                         elif high_p >= t["sl"]:
-                            broadcast_msg(f"🛑 *تم ضرب وقف الخسارة الضيق لـ {t['asset']}.*")
+                            broadcast_msg(f"🛑 *تم ضرب مستوى الوقف ({t['sl']}) لـ {t['asset']}.*")
                             with trades_lock:
                                 active_trades.pop(k, None)
         except Exception as e:
             print(f"Tracker error: {e}")
         time.sleep(TRACKER_INTERVAL)
 
-# ==================== 8. لوحة تحكم المشرف والاستماع للأوامر ====================
+# ==================== 8. لوحة التحكم وإعدادات الربح واللوت ====================
+def send_profit_settings_guide(chat_id):
+    s = user_settings
+    txt = (
+        f"⚙️ *إعدادات الأهداف بالدولار وحجم العقد (Lot):*\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"💼 *النمط الحالي:* `{s['profit_style'].upper()}`\n"
+        f"📦 *حجم اللوت المحسوب:* `{s['lot_size']}`\n"
+        f"✅ *الهدف الأول (TP1):* `+${s['tp1_usd']}`\n"
+        f"🔥 *الهدف الثاني (TP2):* `+${s['tp2_usd']}`\n"
+        f"🚀 *الهدف الثالث (TP3):* `+${s['tp3_usd']}`\n"
+        f"🛑 *وقف الخسارة (SL):* `-${s['sl_usd']}`\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"💡 *كيف تتحكم في الأرباح يدوياً؟*\n"
+        f"• لتخصيص الأهداف بالدولار أرسل:\n"
+        f"`/settp 5 10 20` (أو أي أرقام تريدها لـ TP1 و TP2 و TP3)\n"
+        f"• لتخصيص وقف الخسارة بالدولار أرسل:\n"
+        f"`/setsl 5`\n"
+        f"• لتغيير حجم اللوت أرسل:\n"
+        f"`/setlot 0.01` أو `/setlot 0.05`"
+    )
+    send_msg(txt, chat_id)
+
 def send_admin_panel(chat_id):
     with users_lock:
         app_count = len(users_db["approved"])
@@ -1061,11 +1184,23 @@ def format_active_trades_report():
         if not active_trades:
             return "📂 *لا توجد صفقات نشطة حالياً.*"
         snap = dict(active_trades)
-    lines = ["📂 *المناطق المراقبة تلقائياً (أهداف سريعة 1R / 2R):*\n━━━━━━━━━━━━━━━━━━"]
+    lines = ["📂 *المناطق المراقبة تلقائياً (أهداف بالدولار TP1 / TP2 / TP3):*\n━━━━━━━━━━━━━━━━━━"]
     for k, t in snap.items():
         st = "⏳ بانتظار الملامسة" if t["status"] == "PENDING" else "🔥 مفعل بالسوق"
-        lines.append(f"🔹 *{t['asset']}* ({t['tf']}) | {st}\n   الدخول: `{t['entry_low']} - {t['entry_high']}` | SL: `{t['sl']}` | TP1: `{t['tp1']}` | TP2: `{t['tp2']}`")
+        lines.append(
+            f"🔹 *{t['asset']}* ({t['tf']}) | {st}\n"
+            f"   الدخول: `{t['entry_low']} - {t['entry_high']}` | SL: `{t['sl']}`\n"
+            f"   TP1 (+${t['tp1_usd']}): `{t['tp1']}` | TP2 (+${t['tp2_usd']}): `{t['tp2']}` | TP3 (+${t['tp3_usd']}): `{t['tp3']}`"
+        )
     return "\n".join(lines)
+
+def apply_profit_profile(profile_key):
+    prof = PROFIT_PROFILES.get(profile_key, PROFIT_PROFILES["scalp"])
+    user_settings["profit_style"] = profile_key
+    user_settings["tp1_usd"] = prof["tp1_usd"]
+    user_settings["tp2_usd"] = prof["tp2_usd"]
+    user_settings["tp3_usd"] = prof["tp3_usd"]
+    user_settings["sl_usd"] = prof["sl_usd"]
 
 def telegram_listener():
     global ADMIN_CHAT_ID
@@ -1142,7 +1277,16 @@ def telegram_listener():
                                 user_settings["ltf"] = chosen_tf
                                 user_settings["htf"] = HTF_MAP.get(chosen_tf, "4h")
                                 analyze_and_send_zones(sym_t, chosen_tf, cb_chat)
-                            continue
+                                continue
+
+                            if cb_data.startswith("PMODE|"):
+                                if not is_user_authorized(cb_chat):
+                                    send_msg("🔒 غير مصرح لك باستخدام البوت.", cb_chat, remove_keyboard=True)
+                                    continue
+                                _, sym_t, p_mode = cb_data.split("|")
+                                apply_profit_profile(p_mode)
+                                analyze_and_send_zones(sym_t, user_settings["ltf"], cb_chat)
+                                continue
 
                         msg = item.get("message", {})
                         text = msg.get("text", "").strip()
@@ -1235,20 +1379,87 @@ def telegram_listener():
                                     send_msg("🔒 *هذا البوت خاص ومحمي بكلمة سر.*\n🔑 يرجى إرسال **كلمة السر الصحيحة**:", chat_id, remove_keyboard=True)
                                 continue
 
+                        # أوامر التحكم في الأرباح واللوت للمستخدمين المصرح لهم
+                        if text.startswith("/settp "):
+                            try:
+                                nums = [float(x) for x in text.replace("/settp ", "").split() if x.strip()]
+                                if len(nums) >= 3:
+                                    user_settings["tp1_usd"] = round(nums[0], 2)
+                                    user_settings["tp2_usd"] = round(nums[1], 2)
+                                    user_settings["tp3_usd"] = round(nums[2], 2)
+                                    user_settings["profit_style"] = "custom"
+                                    send_msg(
+                                        f"✅ *تم تحديث الأهداف بالدولار بنجاح:*\n"
+                                        f"• TP1: `+${user_settings['tp1_usd']}`\n"
+                                        f"• TP2: `+${user_settings['tp2_usd']}`\n"
+                                        f"• TP3: `+${user_settings['tp3_usd']}`",
+                                        chat_id
+                                    )
+                                else:
+                                    send_msg("⚠️ يرجى إرسال 3 أرقام للأهداف، مثال:\n`/settp 5 10 20`", chat_id)
+                            except Exception:
+                                send_msg("⚠️ صيغة غير صحيحة، أرسل مثل: `/settp 5 10 20`", chat_id)
+                            continue
+
+                        elif text.startswith("/setsl "):
+                            try:
+                                sl_val = float(text.replace("/setsl ", "").strip())
+                                if sl_val > 0:
+                                    user_settings["sl_usd"] = round(sl_val, 2)
+                                    send_msg(f"🛑 *تم ضبط وقف الخسارة على:* `-${user_settings['sl_usd']}`", chat_id)
+                            except Exception:
+                                send_msg("⚠️ أرسل رقماً صحيحاً، مثال: `/setsl 5`", chat_id)
+                            continue
+
+                        elif text.startswith("/setlot "):
+                            try:
+                                lot_val = float(text.replace("/setlot ", "").strip())
+                                if lot_val >= 0.001:
+                                    user_settings["lot_size"] = round(lot_val, 3)
+                                    send_msg(f"📦 *تم تغيير حجم اللوت إلى:* `{user_settings['lot_size']}`\nسيتم حساب المسافة السعرية للأهداف بناءً على هذا اللوت.", chat_id)
+                            except Exception:
+                                send_msg("⚠️ أرسل رقماً صحيحاً، مثال: `/setlot 0.01`", chat_id)
+                            continue
+
                         if text in ["/start", "/help"]:
-                            send_msg("🤖 *أهلاً بك في نظام الأهداف السريعة (1R / 2R) والوقف الضيق!*", chat_id)
+                            send_msg(
+                                "🤖 *أهلاً بك في نظام القناص (TP1 = $5 | TP2 = $10 | TP3 = $20)!*\n"
+                                "يمكنك التبديل في أي وقت بين ربح السكالب السريع وربح السوينق البعيد من الأزرار بالأسفل.",
+                                chat_id
+                            )
+                        elif text in ["⚙️ إعدادات الربح واللوت", "/settings"]:
+                            send_profit_settings_guide(chat_id)
+                        elif text in ["🎯 ربح سكالب ($5/$10/$20)", "/scalp_profit"]:
+                            apply_profit_profile("scalp")
+                            send_msg(
+                                "🎯 *تم تفعيل نمط ربح السكالبينج السريع:*\n"
+                                "• TP1 = `+$5` | TP2 = `+$10` | TP3 = `+$20` | SL = `-$5`",
+                                chat_id
+                            )
+                        elif text in ["🌊 ربح سوينق بعيد ($15/$30/$60)", "/swing_profit"]:
+                            apply_profit_profile("swing")
+                            send_msg(
+                                "🌊 *تم تفعيل نمط ربح السوينق البعيد:*\n"
+                                "• TP1 = `+$15` | TP2 = `+$30` | TP3 = `+$60` | SL = `-$12`",
+                                chat_id
+                            )
                         elif text in ["🔊 تجربة الناطق العربي", "/sound"]:
-                            test_speech = "أهلاً بك، تم ضبط البوت على وقف الخسارة الضيق والأهداف السريعة واحد آر واثنين آر."
+                            test_speech = (
+                                f"أهلاً بك، تم ضبط الأهداف حالياً على {int(user_settings['tp1_usd'])} دولار للهدف الأول، "
+                                f"و {int(user_settings['tp2_usd'])} دولار للهدف الثاني، و {int(user_settings['tp3_usd'])} دولار للهدف الثالث."
+                            )
                             send_arabic_voice_alert(test_speech, "🗣️ *تجربة الناطق الصوتي باللغة العربية*", chat_id)
                         elif text in ["⚡ فريم سكالب (5m)", "/scalp"]:
                             user_settings.update({"mode_name": TIMEFRAME_MODES["scalp"]["name"], "ltf": "5m", "htf": "15m"})
-                            send_msg("⚡ تم تفعيل فريم 5 دقائق.", chat_id)
+                            apply_profit_profile("scalp")
+                            send_msg("⚡ تم تفعيل فريم 5 دقائق مع أهداف سكالب ($5 / $10 / $20).", chat_id)
                         elif text in ["⏱ فريم متوسط (15m)", "/intraday"]:
                             user_settings.update({"mode_name": TIMEFRAME_MODES["intraday"]["name"], "ltf": "15m", "htf": "4h"})
                             send_msg("⏱ تم تفعيل الفريم المتوسط 15 دقيقة.", chat_id)
                         elif text in ["🌊 فريم طويل (4h/1d)", "/swing"]:
                             user_settings.update({"mode_name": TIMEFRAME_MODES["swing"]["name"], "ltf": "4h", "htf": "1d"})
-                            send_msg("🌊 تم تفعيل الفريم الطويل 4 ساعات.", chat_id)
+                            apply_profit_profile("swing")
+                            send_msg("🌊 تم تفعيل الفريم الطويل 4 ساعات مع أهداف سوينق بعيدة ($15 / $30 / $60).", chat_id)
                         elif text in ["/gold", "🪙 مناطق دخول الذهب"]:
                             analyze_and_send_zones("GOLD", user_settings["ltf"], chat_id)
                         elif text in ["/btc", "₿ مناطق دخول البيتكوين"]:
@@ -1268,7 +1479,7 @@ def telegram_listener():
 
 @app.route("/")
 def home():
-    return "Persistent Users + Fast 1R/2R Institutional Bot is Live 24/7!"
+    return "Persistent Users + Dynamic USD Targets ($5/$10/$20) Bot is Live 24/7!"
 
 @app.route("/health")
 def health():
@@ -1302,8 +1513,8 @@ if __name__ == "__main__":
     threading.Thread(target=trade_tracker_loop, daemon=True).start()
     threading.Thread(target=keep_alive_pinger, daemon=True).start()
     send_msg(
-        "💾 *تم تفعيل نظام الحفظ الدائم للمستخدمين (Persistent Storage) بنجاح!*\n"
-        "• لن يضطر أي مستخدم وافقت عليه سابقاً لإعادة إدخال كلمة السر حتى لو أُعيد تشغيل خادم Render بالكامل."
+        "🚀 *تم تشغيل البوت بنظام الأهداف الثلاثة بالدولار ($5 / $10 / $20) والتحكم بين السكالب والسوينق!*\n"
+        "• يمكنك التبديل الفوري من الأزرار أو إرسال `/settp 5 10 20` و `/setlot 0.01`."
     )
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)

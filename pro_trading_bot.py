@@ -227,14 +227,13 @@ def send_approval_email(user_id, full_name, username):
     except Exception as e:
         return False, str(e)
 
-def get_inline_tf_buttons(sym_type, is_long=True):
-    """أزرار الشارت الشفافة مع زر الدخول المباشر بالسعر الحالي (Market Execution)"""
-    mkt_dir = "BUY" if is_long else "SELL"
-    mkt_label = "⚡ دخول شراء مباشر بالسعر الحالي (Market)" if is_long else "⚡ دخول بيع مباشر بالسعر الحالي (Market)"
+def get_inline_tf_buttons(sym_type):
+    """أزرار الشارت الشفافة مع زرين منفصلين بجانب بعضهما (شراء Market وبيع Market)"""
     return {
         "inline_keyboard": [
             [
-                {"text": mkt_label, "callback_data": f"MKT|{sym_type}|{mkt_dir}"}
+                {"text": "🟢 شراء فوري (Market Buy)", "callback_data": f"MKT|{sym_type}|BUY"},
+                {"text": "🔴 بيع فوري (Market Sell)", "callback_data": f"MKT|{sym_type}|SELL"}
             ],
             [
                 {"text": "⚡ 5m", "callback_data": f"TF|{sym_type}|5m"},
@@ -325,11 +324,11 @@ def send_arabic_voice_alert(spoken_text, caption, chat_id):
     except Exception:
         send_msg(caption, target)
 
-def send_photo_msg(photo_buf, caption, sym_type, chat_id, is_long=True):
+def send_photo_msg(photo_buf, caption, sym_type, chat_id):
     target = str(chat_id).strip()
     if not TELEGRAM_BOT_TOKEN or not target:
         return
-    inline_kb = get_inline_tf_buttons(sym_type, is_long)
+    inline_kb = get_inline_tf_buttons(sym_type)
     if photo_buf is None:
         send_msg(caption, target, inline_kb)
         return
@@ -1130,7 +1129,7 @@ def analyze_and_send_zones(sym_type, ltf_str, chat_id):
     caption = (
         f"🎯 *بطاقة الصفقة الذكية — {asset_name} ({ltf_use}):*\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"📌 *القرار:* *{dir_label}*\n"
+        f"📌 *القرار المقترح:* *{dir_label}*\n"
         f"💵 *السعر الحالي:* `{curr_price}` ({prox_txt})\n"
         f"⭐ *قوة الصفقة:* `{strat_res['confidence']}%` ({strat_res['stars']} توافق `{strat_res['aligned_count']}/10`)\n"
         f"━━━━━━━━━━━━━━━━━━\n"
@@ -1142,16 +1141,16 @@ def analyze_and_send_zones(sym_type, ltf_str, chat_id):
         f"━━━━━━━━━━━━━━━━━━\n"
         f"💡 *خلاصة التحليل:* {strat_res['summary_reasons']}\n"
         f"🌍 *السيولة والدولار:* دلتا السيولة {strat_res['cvd_state']} | {strat_res['dxy_text']}\n"
-        f"👇 *للشراء أو البيع فوراً بالسعر الحالي اضغطي الزر الأول بالأسفل:*"
+        f"👇 *للدخول الفوري بالسعر الحالي اختاري (شراء فوري أو بيع فوري) بالأسفل:*"
     )
 
     chart_buf = generate_clean_chart_image(
         ltf, zones, vp_data, strat_res, f"{chart_code} ({ltf_use})", entry_zone, sl, exit_targets, usd_targets, is_market=False
     )
-    send_photo_msg(chart_buf, caption, sym_type, cid, is_long=is_long)
+    send_photo_msg(chart_buf, caption, sym_type, cid)
 
 def execute_instant_market_trade(sym_type, mkt_dir, chat_id):
-    """حساب الأهداف والستوب فوراً من السعر اللحظي الحالي وتفعيل المراقبة الصوتية مباشرة"""
+    """حساب الأهداف والستوب فوراً من السعر اللحظي الحالي حسب الزر المضغوط (BUY أو SELL)"""
     cid = str(chat_id).strip()
     u_prefs = get_user_settings(cid)
     ltf_use = u_prefs["ltf"]
@@ -1178,7 +1177,8 @@ def execute_instant_market_trade(sym_type, mkt_dir, chat_id):
     vp_data = calculate_volume_profile(ltf, num_bins=24)
     strat_res = evaluate_10_strategies_clean(ltf, htf, div_info, bos_events, vp_data)
 
-    is_long = True if mkt_dir == "BUY" else (False if mkt_dir == "SELL" else strat_res["is_long"])
+    is_long = (mkt_dir == "BUY")
+    strat_res["is_long"] = is_long
     curr_price = round(float(ltf["close"].iloc[-1]), 2)
 
     lot = u_prefs["lot_size"]
@@ -1190,13 +1190,13 @@ def execute_instant_market_trade(sym_type, mkt_dir, chat_id):
     dist_sl = usd_to_price_distance(sym_type, u_sl, lot)
 
     if is_long:
-        dir_label = "🟢 دخول شراء مباشر الآن (MARKET BUY)"
+        dir_label = "🟢 دخول شراء فوري الآن (MARKET BUY)"
         sl = round(curr_price - dist_sl, 2)
         tp1 = round(curr_price + dist_tp1, 2)
         tp2 = round(curr_price + dist_tp2, 2)
         tp3 = round(curr_price + dist_tp3, 2)
     else:
-        dir_label = "🔴 دخول بيع مباشر الآن (MARKET SELL)"
+        dir_label = "🔴 دخول بيع فوري الآن (MARKET SELL)"
         sl = round(curr_price + dist_sl, 2)
         tp1 = round(curr_price - dist_tp1, 2)
         tp2 = round(curr_price - dist_tp2, 2)
@@ -1212,11 +1212,10 @@ def execute_instant_market_trade(sym_type, mkt_dir, chat_id):
         "dist_from_curr": 0.0
     }
 
-    # تسجيل الصفقة كصفقة مفعلة فوراً (ACTIVE) ليبدأ الرادار بمراقبة الأهداف مباشرة
     register_private_trade(cid, asset_name, sym_type, is_long, market_zone, sl, exit_targets, usd_targets, ltf_use, is_market=True)
 
     caption = (
-        f"⚡ *بطاقة تنفيذ مباشر بالسعر الحالي — {asset_name}:*\n"
+        f"⚡ *بطاقة تنفيذ فوري بالسعر الحالي — {asset_name}:*\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📌 *النوع:* *{dir_label}*\n"
         f"💵 *سعر الدخول الفوري:* `{curr_price}` *(مفعلة الآن 🔥)*\n"
@@ -1231,9 +1230,9 @@ def execute_instant_market_trade(sym_type, mkt_dir, chat_id):
     )
 
     chart_buf = generate_clean_chart_image(
-        ltf, zones, vp_data, strat_res, f"{chart_code} (MARKET {ltf_use})", market_zone, sl, exit_targets, usd_targets, is_market=True
+        ltf, zones, vp_data, strat_res, f"{chart_code} (MARKET {mkt_dir} {ltf_use})", market_zone, sl, exit_targets, usd_targets, is_market=True
     )
-    send_photo_msg(chart_buf, caption, sym_type, cid, is_long=is_long)
+    send_photo_msg(chart_buf, caption, sym_type, cid)
 
 def get_latest_price_extremes(symbol_type):
     df = get_btc_ohlcv("1m", limit=3) if symbol_type == "BTC" else get_gold_ohlcv("5m")
@@ -1463,8 +1462,9 @@ def format_user_trades_report(chat_id):
     lines = ["📂 *صفقاتك الخاصة المراقبة تلقائياً:*\n━━━━━━━━━━━━━━━━━━"]
     for k, t in user_trades.items():
         st = "⏳ بانتظار الملامسة" if t["status"] == "PENDING" else "🔥 مفعل بالسوق الآن"
+        dir_ic = "🟢 شراء" if t["is_long"] else "🔴 بيع"
         lines.append(
-            f"🔹 *{t['asset']}* ({t['tf']}) | {st}\n"
+            f"🔹 *{t['asset']}* ({t['tf']}) | {dir_ic} | {st}\n"
             f"   الدخول: `{t['entry_mid']}` | SL: `{t['sl']}`\n"
             f"   TP1 (+${t['tp1_usd']}): `{t['tp1']}` | TP2 (+${t['tp2_usd']}): `{t['tp2']}` | TP3 (+${t['tp3_usd']}): `{t['tp3']}`"
         )
@@ -1542,7 +1542,7 @@ def telegram_listener():
                                             send_msg(f"⏳ *طلب تفعيل معلق:*\nالاسم: `{u_info['name']}` (`@{u_info['username']}`)\nID: `{u_id}`", cb_chat, kb)
                                 continue
 
-                            # معالجة زر الدخول المباشر بالسعر الحالي (MKT|)
+                            # معالجة زري الشراء والبيع الفوري بالسعر الحالي (MKT|...|BUY أو MKT|...|SELL)
                             if cb_data.startswith("MKT|"):
                                 if not is_user_authorized(cb_chat):
                                     send_msg("🔒 غير مصرح لك باستخدام البوت.", cb_chat, remove_keyboard=True)
@@ -1578,7 +1578,7 @@ def telegram_listener():
                                     analyze_and_send_zones("GOLD", u_s["ltf"], cb_chat)
                                     analyze_and_send_zones("BTC", u_s["ltf"], cb_chat)
                                 elif m_act == "TEST_VOICE":
-                                    test_speech = f"أهلاً بك، نظام الدخول المباشر والواجهة المبسطة يعملان بنجاح، والهدف الأول مضبوط على {int(u_s['tp1_usd'])} دولار."
+                                    test_speech = f"أهلاً بك، أزرار الشراء والبيع الفوري بالسعر الحالي تعمل بنجاح، والهدف الأول مضبوط على {int(u_s['tp1_usd'])} دولار."
                                     send_arabic_voice_alert(test_speech, "🗣️ *تجربة الناطق الصوتي الخاص بحسابك*", cb_chat)
                                 elif m_act == "CLEAR_TRADES":
                                     clear_user_trades(cb_chat)
@@ -1730,8 +1730,8 @@ def telegram_listener():
 
                         if text in ["/start", "/help"]:
                             send_msg(
-                                "🤖 *أهلاً بك في الإصدار الاحترافي المبسط (10-in-1 + Market Execution)!*\n"
-                                "• يمكنك انتظار المنطقة القريبة أو الضغط على زر **`⚡ دخول مباشر بالسعر الحالي (Market)`** أسفل الشارت.",
+                                "🤖 *أهلاً بك في الإصدار الاحترافي المبسط (10-in-1 + Market Buy/Sell)!*\n"
+                                "• ستجدين أسفل كل شارت زرين منفصلين: **`🟢 شراء فوري (Market Buy)`** و **`🔴 بيع فوري (Market Sell)`** لحساب الأهداف فوراً من السعر الحالي.",
                                 chat_id
                             )
                         elif text in ["⚙️ الإعدادات والتحكم", "⚙️ إعدادات الربح واللوت", "/settings"]:
@@ -1754,7 +1754,7 @@ def telegram_listener():
 
 @app.route("/")
 def home():
-    return "10-Strategy + Instant Market Execution Bot is Live 24/7!"
+    return "10-Strategy + Dual Market Buy/Sell Bot is Live 24/7!"
 
 @app.route("/health")
 def health():
@@ -1788,8 +1788,7 @@ if __name__ == "__main__":
     threading.Thread(target=keep_alive_pinger, daemon=True).start()
     if ADMIN_CHAT_ID:
         send_msg(
-            "⚡ *تمت إضافة زر الدخول المباشر بالسعر الحالي (`Market Execution`) أسفل الشارت بنجاح!*\n"
-            "• عند الضغط عليه يحسب البوت فوراً `SL` و `TP1 / TP2 / TP3` من السعر اللحظي ويفعل الرادار الصوتي مباشرة.",
+            "✅ *تمت إضافة زري الشراء الفوري والبيع الفوري (`🟢 Market Buy` | `🔴 Market Sell`) جنباً إلى جنب أسفل الشارت!*",
             ADMIN_CHAT_ID
         )
     port = int(os.environ.get("PORT", 10000))

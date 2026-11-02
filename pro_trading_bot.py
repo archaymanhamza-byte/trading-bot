@@ -133,13 +133,11 @@ def usd_to_price_distance(sym_type, usd_amount, lot_size):
 
 app = Flask(__name__)
 
+# ==================== لوحة الأزرار السفلية المختصرة (صفان فقط!) ====================
 USER_KEYBOARD = {
     "keyboard": [
-        [{"text": "🪙 مناطق دخول الذهب"}, {"text": "₿ مناطق دخول البيتكوين"}],
-        [{"text": "🎯 ربح سكالب ($5/$10/$20)"}, {"text": "🌊 ربح سوينق بعيد ($15/$30/$60)"}],
-        [{"text": "⚡ فريم سكالب (5m)"}, {"text": "⏱ فريم متوسط (15m)"}, {"text": "🌊 فريم طويل (4h/1d)"}],
-        [{"text": "📊 فحص شامل بالسوق"}, {"text": "📂 الأوامر المعلقة والنشطة"}, {"text": "⚙️ إعدادات الربح واللوت"}],
-        [{"text": "🔊 تجربة الناطق العربي"}]
+        [{"text": "🪙 تحليل الذهب"}, {"text": "₿ تحليل البيتكوين"}],
+        [{"text": "📂 الصفقات النشطة"}, {"text": "⚙️ الإعدادات والتحكم"}]
     ],
     "resize_keyboard": True,
     "is_persistent": True
@@ -147,11 +145,8 @@ USER_KEYBOARD = {
 
 ADMIN_KEYBOARD = {
     "keyboard": [
-        [{"text": "🪙 مناطق دخول الذهب"}, {"text": "₿ مناطق دخول البيتكوين"}],
-        [{"text": "🎯 ربح سكالب ($5/$10/$20)"}, {"text": "🌊 ربح سوينق بعيد ($15/$30/$60)"}],
-        [{"text": "⚡ فريم سكالب (5m)"}, {"text": "⏱ فريم متوسط (15m)"}, {"text": "🌊 فريم طويل (4h/1d)"}],
-        [{"text": "📊 فحص شامل بالسوق"}, {"text": "📂 الأوامر المعلقة والنشطة"}, {"text": "⚙️ إعدادات الربح واللوت"}],
-        [{"text": "🔐 لوحة تحكم المشرف"}, {"text": "🔊 تجربة الناطق العربي"}, {"text": "🗑️ مسح الصفقات"}]
+        [{"text": "🪙 تحليل الذهب"}, {"text": "₿ تحليل البيتكوين"}],
+        [{"text": "📂 الصفقات النشطة"}, {"text": "⚙️ الإعدادات والتحكم"}, {"text": "🔐 المشرف"}]
     ],
     "resize_keyboard": True,
     "is_persistent": True
@@ -231,11 +226,11 @@ def get_inline_tf_buttons(sym_type):
                 {"text": "⏱ 15m", "callback_data": f"TF|{sym_type}|15m"},
                 {"text": "🕐 1h", "callback_data": f"TF|{sym_type}|1h"},
                 {"text": "🕓 4h", "callback_data": f"TF|{sym_type}|4h"},
-                {"text": "📅 1d يومي", "callback_data": f"TF|{sym_type}|1d"}
+                {"text": "📅 1d", "callback_data": f"TF|{sym_type}|1d"}
             ],
             [
-                {"text": "🎯 دخول وأهداف سكالب ($5/$10/$20)", "callback_data": f"PMODE|{sym_type}|scalp"},
-                {"text": "🌊 دخول وأهداف سوينق ($15/$30/$60)", "callback_data": f"PMODE|{sym_type}|swing"}
+                {"text": "🎯 سكالب ($5/$10/$20)", "callback_data": f"PMODE|{sym_type}|scalp"},
+                {"text": "🌊 سوينق ($15/$30/$60)", "callback_data": f"PMODE|{sym_type}|swing"}
             ]
         ]
     }
@@ -642,7 +637,7 @@ def evaluate_multi_strategies(ltf, htf, div_info, bos_events, vp_data):
         "s1_status": s1_status, "s2_status": s2_status, "s3_status": s3_status, "s4_status": s4_status, "s5_status": s5_status
     }
 
-# ==================== 5. كشف الدايفرجنس وهيكل السوق ومحرك الاقتناص القريب الذكي ====================
+# ==================== 5. كشف الدايفرجنس وهيكل السوق ومحرك الاقتناص القريب ====================
 def detect_rsi_macd_divergence(plot_df):
     n = len(plot_df)
     if n < 20:
@@ -842,7 +837,7 @@ def analyze_structure_and_ote(df, is_long_bias=True, sym_type="GOLD", vp_data=No
         "supply_zone": (supply_bottom, supply_top)
     }
 
-# ==================== 6. رسم الشارت المتكامل مع المنطقة القريبة و TP1 / TP2 / TP3 ====================
+# ==================== 6. رسم الشارت المتكامل ====================
 def generate_chart_image(df, zones, vp_data, div_info, bos_events, asset_title, entry_zone, sl, exit_targets, usd_targets, is_long=True):
     try:
         plot_df = df.tail(55).reset_index(drop=True)
@@ -1197,28 +1192,43 @@ def trade_tracker_loop():
             print(f"Tracker error: {e}")
         time.sleep(TRACKER_INTERVAL)
 
-# ==================== 8. لوحة التحكم وإعدادات الربح واللوت ====================
-def send_profit_settings_guide(chat_id):
+# ==================== 8. القائمة المختصرة الموحدة (⚙️ الإعدادات والتحكم) ====================
+def send_compact_control_menu(chat_id):
     s = user_settings
     txt = (
-        f"⚙️ *إعدادات الأهداف بالدولار وحجم العقد (Lot):*\n"
+        f"🎛️ *قائمة الإعدادات والتحكم السريع:*\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"💼 *النمط الحالي:* `{s['profit_style'].upper()}`\n"
-        f"📦 *حجم اللوت المحسوب:* `{s['lot_size']}`\n"
-        f"✅ *الهدف الأول (TP1):* `+${s['tp1_usd']}`\n"
-        f"🔥 *الهدف الثاني (TP2):* `+${s['tp2_usd']}`\n"
-        f"🚀 *الهدف الثالث (TP3):* `+${s['tp3_usd']}`\n"
-        f"🛑 *وقف الخسارة (SL):* `-${s['sl_usd']}`\n"
+        f"⏱ *الفريم الحالي:* `{s['ltf']}` (الأكبر `{s['htf']}`)\n"
+        f"💼 *نمط الربح:* `{s['profit_style'].upper()}` | *اللوت:* `{s['lot_size']}`\n"
+        f"🎯 *الأهداف:* `+$ {s['tp1_usd']}` | `+$ {s['tp2_usd']}` | `+$ {s['tp3_usd']}` (SL: `-$ {s['sl_usd']}`)\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"💡 *كيف تتحكم في الأرباح يدوياً؟*\n"
-        f"• لتخصيص الأهداف بالدولار أرسل:\n"
-        f"`/settp 5 10 20` (أو أي أرقام تريدها لـ TP1 و TP2 و TP3)\n"
-        f"• لتخصيص وقف الخسارة بالدولار أرسل:\n"
-        f"`/setsl 5`\n"
-        f"• لتغيير حجم اللوت أرسل:\n"
-        f"`/setlot 0.01` أو `/setlot 0.05`"
+        f"💡 *أوامر التخصيص اليدوي السريع:*\n"
+        f"• لتغيير الأهداف: `/settp 5 10 20`\n"
+        f"• لتغيير الستوب: `/setsl 5`\n"
+        f"• لتغيير اللوت: `/setlot 0.01`\n"
+        f"👇 *اختر الإجراء المطلوب بضغطة واحدة:*"
     )
-    send_msg(txt, chat_id)
+    inline_menu = {
+        "inline_keyboard": [
+            [
+                {"text": "⚡ وضع سكالب (5m | $5/$10/$20)", "callback_data": "MENU|MODE_SCALP"},
+                {"text": "🌊 وضع سوينق (4h | $15/$30/$60)", "callback_data": "MENU|MODE_SWING"}
+            ],
+            [
+                {"text": "⏱ فريم 15m", "callback_data": "MENU|TF_15m"},
+                {"text": "🕐 فريم 1h", "callback_data": "MENU|TF_1h"},
+                {"text": "📅 فريم يومي 1d", "callback_data": "MENU|TF_1d"}
+            ],
+            [
+                {"text": "📊 فحص شامل (ذهب + بيتكوين)", "callback_data": "MENU|SCAN_ALL"},
+                {"text": "🔊 تجربة الصوت العربي", "callback_data": "MENU|TEST_VOICE"}
+            ],
+            [
+                {"text": "🗑️ مسح الصفقات النشطة", "callback_data": "MENU|CLEAR_TRADES"}
+            ]
+        ]
+    }
+    send_msg(txt, chat_id, inline_menu)
 
 def send_admin_panel(chat_id):
     with users_lock:
@@ -1261,7 +1271,7 @@ def approve_user_action(uid):
             "joined": time.strftime("%Y-%m-%d %H:%M", time.gmtime())
         }
         save_users_to_disk()
-    send_msg("🎉 *تمت موافقة المشرف على طلبك بنجاح!*\nيمكنك الآن استخدام جميع استراتيجيات البوت الخمس من الأزرار بالأسفل:", uid)
+    send_msg("🎉 *تمت موافقة المشرف على طلبك بنجاح!*\nيمكنك الآن استخدام البوت من الأزرار المختصرة بالأسفل:", uid)
     send_msg(f"✅ *تم تفعيل المستخدم:* `{info.get('name')}` (`{uid}`) بنجاح.", ADMIN_CHAT_ID)
 
 def reject_or_delete_user_action(uid):
@@ -1363,6 +1373,39 @@ def telegram_listener():
                                             send_msg(f"⏳ *طلب تفعيل معلق:*\nالاسم: `{u_info['name']}` (`@{u_info['username']}`)\nID: `{u_id}`", cb_chat, kb)
                                 continue
 
+                            # معالجة أزرار القائمة المختصرة الجديدة (MENU|)
+                            if cb_data.startswith("MENU|"):
+                                if not is_user_authorized(cb_chat):
+                                    send_msg("🔒 غير مصرح لك باستخدام البوت.", cb_chat, remove_keyboard=True)
+                                    continue
+                                m_act = cb_data.split("|")[1]
+                                if m_act == "MODE_SCALP":
+                                    user_settings.update({"mode_name": TIMEFRAME_MODES["scalp"]["name"], "ltf": "5m", "htf": "15m"})
+                                    apply_profit_profile("scalp")
+                                    send_msg("⚡ *تم تفعيل وضع السكالبينج القريب:*\nفريم `5m` | دخول قريب `1$-2$` | أهداف `+$5 / +$10 / +$20`.", cb_chat)
+                                elif m_act == "MODE_SWING":
+                                    user_settings.update({"mode_name": TIMEFRAME_MODES["swing"]["name"], "ltf": "4h", "htf": "1d"})
+                                    apply_profit_profile("swing")
+                                    send_msg("🌊 *تم تفعيل وضع السوينق البعيد:*\nفريم `4h` | دخول متوازن `4$-8$` | أهداف `+$15 / +$30 / +$60`.", cb_chat)
+                                elif m_act.startswith("TF_"):
+                                    chosen_tf = m_act.replace("TF_", "")
+                                    user_settings["ltf"] = chosen_tf
+                                    user_settings["htf"] = HTF_MAP.get(chosen_tf, "4h")
+                                    send_msg(f"⏱ *تم ضبط الفريم الافتراضي على `{chosen_tf}`.* اضغط الآن على الذهب أو البيتكوين.", cb_chat)
+                                elif m_act == "SCAN_ALL":
+                                    analyze_and_send_zones("GOLD", user_settings["ltf"], cb_chat)
+                                    analyze_and_send_zones("BTC", user_settings["ltf"], cb_chat)
+                                elif m_act == "TEST_VOICE":
+                                    test_speech = (
+                                        f"أهلاً بك، الواجهة المختصرة تعمل بنجاح، والأهداف مضبوطة على {int(user_settings['tp1_usd'])} دولار للهدف الأول."
+                                    )
+                                    send_arabic_voice_alert(test_speech, "🗣️ *تجربة الناطق الصوتي باللغة العربية*", cb_chat)
+                                elif m_act == "CLEAR_TRADES":
+                                    with trades_lock:
+                                        active_trades.clear()
+                                    send_msg("🗑️ *تم مسح جميع الصفقات النشطة بنجاح.*", cb_chat)
+                                continue
+
                             if cb_data.startswith("TF|"):
                                 if not is_user_authorized(cb_chat):
                                     send_msg("🔒 غير مصرح لك باستخدام البوت.", cb_chat, remove_keyboard=True)
@@ -1392,7 +1435,7 @@ def telegram_listener():
                         username = chat_obj.get("username", "بدون_معرف")
 
                         if is_admin(chat_id):
-                            if text in ["🔐 لوحة تحكم المشرف", "/admin"]:
+                            if text in ["🔐 المشرف", "🔐 لوحة تحكم المشرف", "/admin"]:
                                 send_admin_panel(chat_id)
                                 continue
                             elif text.startswith("/setpass "):
@@ -1483,15 +1526,11 @@ def telegram_listener():
                                     user_settings["profit_style"] = "custom"
                                     send_msg(
                                         f"✅ *تم تحديث الأهداف بالدولار بنجاح:*\n"
-                                        f"• TP1: `+${user_settings['tp1_usd']}`\n"
-                                        f"• TP2: `+${user_settings['tp2_usd']}`\n"
-                                        f"• TP3: `+${user_settings['tp3_usd']}`",
+                                        f"• TP1: `+${user_settings['tp1_usd']}` | TP2: `+${user_settings['tp2_usd']}` | TP3: `+${user_settings['tp3_usd']}`",
                                         chat_id
                                     )
-                                else:
-                                    send_msg("⚠️ يرجى إرسال 3 أرقام للأهداف، مثال:\n`/settp 5 10 20`", chat_id)
                             except Exception:
-                                send_msg("⚠️ صيغة غير صحيحة، أرسل مثل: `/settp 5 10 20`", chat_id)
+                                send_msg("⚠️ أرسل مثل: `/settp 5 10 20`", chat_id)
                             continue
 
                         elif text.startswith("/setsl "):
@@ -1501,7 +1540,7 @@ def telegram_listener():
                                     user_settings["sl_usd"] = round(sl_val, 2)
                                     send_msg(f"🛑 *تم ضبط وقف الخسارة على:* `-${user_settings['sl_usd']}`", chat_id)
                             except Exception:
-                                send_msg("⚠️ أرسل رقماً صحيحاً، مثال: `/setsl 5`", chat_id)
+                                send_msg("⚠️ أرسل مثل: `/setsl 5`", chat_id)
                             continue
 
                         elif text.startswith("/setlot "):
@@ -1509,62 +1548,29 @@ def telegram_listener():
                                 lot_val = float(text.replace("/setlot ", "").strip())
                                 if lot_val >= 0.001:
                                     user_settings["lot_size"] = round(lot_val, 3)
-                                    send_msg(f"📦 *تم تغيير حجم اللوت إلى:* `{user_settings['lot_size']}`\nسيتم حساب المسافة السعرية للأهداف بناءً على هذا اللوت.", chat_id)
+                                    send_msg(f"📦 *تم تغيير حجم اللوت إلى:* `{user_settings['lot_size']}`", chat_id)
                             except Exception:
-                                send_msg("⚠️ أرسل رقماً صحيحاً، مثال: `/setlot 0.01`", chat_id)
+                                send_msg("⚠️ أرسل مثل: `/setlot 0.01`", chat_id)
                             continue
 
                         if text in ["/start", "/help"]:
                             send_msg(
-                                "🤖 *أهلاً بك في نظام الاقتناص القريب (Smart Proximity Entry)!*\n"
-                                "• في السكالب: مناطق الدخول تبعد `1$ إلى 2$` فقط في الذهب عند أقرب ارتكاز آمن.\n"
-                                "• في السوينق: مناطق الدخول أوسع قليلاً (`4$ إلى 8$`) مع أهداف سوينق كبيرة.",
+                                "🤖 *أهلاً بك في الواجهة المختصرة الجديدة!*\n"
+                                "• تم تقليص الأزرار السفلية إلى صفين فقط لراحة الشاشة.\n"
+                                "• اضغط على **`⚙️ الإعدادات والتحكم`** لتغيير الفريم أو التبديل بين السكالب والسوينق.",
                                 chat_id
                             )
-                        elif text in ["⚙️ إعدادات الربح واللوت", "/settings"]:
-                            send_profit_settings_guide(chat_id)
-                        elif text in ["🎯 ربح سكالب ($5/$10/$20)", "/scalp_profit"]:
-                            apply_profit_profile("scalp")
-                            send_msg(
-                                "🎯 *تم تفعيل نمط السكالبينج القريب:*\n"
-                                "• مسافة الدخول في الذهب: `1$ - 2$` عن السعر الحالي.\n"
-                                "• الأهداف: TP1 = `+$5` | TP2 = `+$10` | TP3 = `+$20` | SL = `-$5`",
-                                chat_id
-                            )
-                        elif text in ["🌊 ربح سوينق بعيد ($15/$30/$60)", "/swing_profit"]:
-                            apply_profit_profile("swing")
-                            send_msg(
-                                "🌊 *تم تفعيل نمط السوينق البعيد:*\n"
-                                "• مسافة الدخول في الذهب: `4$ - 8$` عن السعر الحالي.\n"
-                                "• الأهداف: TP1 = `+$15` | TP2 = `+$30` | TP3 = `+$60` | SL = `-$12`",
-                                chat_id
-                            )
-                        elif text in ["🔊 تجربة الناطق العربي", "/sound"]:
-                            test_speech = (
-                                f"أهلاً بك، تم تفعيل نظام مناطق الدخول القريبة والآمنة، مع أهداف {int(user_settings['tp1_usd'])} دولار للهدف الأول، "
-                                f"و {int(user_settings['tp2_usd'])} دولار للهدف الثاني، و {int(user_settings['tp3_usd'])} دولار للهدف الثالث."
-                            )
-                            send_arabic_voice_alert(test_speech, "🗣️ *تجربة الناطق الصوتي باللغة العربية*", chat_id)
-                        elif text in ["⚡ فريم سكالب (5m)", "/scalp"]:
-                            user_settings.update({"mode_name": TIMEFRAME_MODES["scalp"]["name"], "ltf": "5m", "htf": "15m"})
-                            apply_profit_profile("scalp")
-                            send_msg("⚡ تم تفعيل فريم 5 دقائق مع دخول قريب جداً (`1$ - 2$`) وأهداف سكالب ($5 / $10 / $20).", chat_id)
-                        elif text in ["⏱ فريم متوسط (15m)", "/intraday"]:
-                            user_settings.update({"mode_name": TIMEFRAME_MODES["intraday"]["name"], "ltf": "15m", "htf": "4h"})
-                            send_msg("⏱ تم تفعيل الفريم المتوسط 15 دقيقة.", chat_id)
-                        elif text in ["🌊 فريم طويل (4h/1d)", "/swing"]:
-                            user_settings.update({"mode_name": TIMEFRAME_MODES["swing"]["name"], "ltf": "4h", "htf": "1d"})
-                            apply_profit_profile("swing")
-                            send_msg("🌊 تم تفعيل الفريم الطويل 4 ساعات مع دخول سوينق متوازن وأهداف ($15 / $30 / $60).", chat_id)
-                        elif text in ["/gold", "🪙 مناطق دخول الذهب"]:
+                        elif text in ["⚙️ الإعدادات والتحكم", "⚙️ إعدادات الربح واللوت", "/settings"]:
+                            send_compact_control_menu(chat_id)
+                        elif text in ["/gold", "🪙 تحليل الذهب", "🪙 مناطق دخول الذهب"]:
                             analyze_and_send_zones("GOLD", user_settings["ltf"], chat_id)
-                        elif text in ["/btc", "₿ مناطق دخول البيتكوين"]:
+                        elif text in ["/btc", "₿ تحليل البيتكوين", "₿ مناطق دخول البيتكوين"]:
                             analyze_and_send_zones("BTC", user_settings["ltf"], chat_id)
+                        elif text in ["/trades", "📂 الصفقات النشطة", "📂 الأوامر المعلقة والنشطة"]:
+                            send_msg(format_active_trades_report(), chat_id)
                         elif text in ["/status", "/all", "📊 فحص شامل بالسوق"]:
                             analyze_and_send_zones("GOLD", user_settings["ltf"], chat_id)
                             analyze_and_send_zones("BTC", user_settings["ltf"], chat_id)
-                        elif text in ["/trades", "📂 الأوامر المعلقة والنشطة"]:
-                            send_msg(format_active_trades_report(), chat_id)
                         elif text in ["/clear", "🗑️ مسح الصفقات"] and is_admin(chat_id):
                             with trades_lock:
                                 active_trades.clear()
@@ -1575,7 +1581,7 @@ def telegram_listener():
 
 @app.route("/")
 def home():
-    return "Smart Proximity Entry + Dynamic USD Targets Bot is Live 24/7!"
+    return "Compact UI + Smart Proximity Bot is Live 24/7!"
 
 @app.route("/health")
 def health():
@@ -1609,9 +1615,8 @@ if __name__ == "__main__":
     threading.Thread(target=trade_tracker_loop, daemon=True).start()
     threading.Thread(target=keep_alive_pinger, daemon=True).start()
     send_msg(
-        "🎯 *تم إصلاح الخطأ وتفعيل محرك الاقتناص القريب والآمن (Smart Proximity Entry) بنجاح!*\n"
-        "• في نمط السكالب: مناطق دخول الذهب تبعد **`1$ إلى 2$` فقط** عند أقرب ارتكاز مؤسسي.\n"
-        "• في نمط السوينق: مناطق الدخول أوسع قليلاً (`4$ إلى 8$`) لتناسب الصفقات الطويلة."
+        "✨ *تم تحديث واجهة البوت إلى التصميم المختصر (صفين فقط أسفل الشاشة)!*\n"
+        "• جميع خيارات الفريمات والسكالب والسوينق والصوت أصبحت داخل زر **`⚙️ الإعدادات والتحكم`**."
     )
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)

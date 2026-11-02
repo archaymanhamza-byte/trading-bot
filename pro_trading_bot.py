@@ -107,11 +107,11 @@ user_settings = {
     "ltf": "15m",
     "htf": "4h",
     "profit_style": "scalp",
-    "lot_size": 0.01,       # حجم اللوت الافتراضي لحساب مسافة الدولارات
-    "tp1_usd": 5.0,         # الهدف الأول بالدولار
-    "tp2_usd": 10.0,        # الهدف الثاني بالدولار
-    "tp3_usd": 20.0,        # الهدف الثالث بالدولار
-    "sl_usd": 5.0           # وقف الخسارة بالدولار
+    "lot_size": 0.01,        # حجم اللوت الافتراضي لحساب مسافة الدولارات
+    "tp1_usd": 5.0,          # الهدف الأول بالدولار
+    "tp2_usd": 10.0,         # الهدف الثاني بالدولار
+    "tp3_usd": 20.0,         # الهدف الثالث بالدولار
+    "sl_usd": 5.0            # وقف الخسارة بالدولار
 }
 
 TIMEFRAME_MODES = {
@@ -239,8 +239,8 @@ def get_inline_tf_buttons(sym_type):
                 {"text": "📅 1d يومي", "callback_data": f"TF|{sym_type}|1d"}
             ],
             [
-                {"text": "🎯 أهداف سكالب ($5/$10/$20)", "callback_data": f"PMODE|{sym_type}|scalp"},
-                {"text": "🌊 أهداف سوينق ($15/$30/$60)", "callback_data": f"PMODE|{sym_type}|swing"}
+                {"text": "🎯 دخول وأهداف سكالب ($5/$10/$20)", "callback_data": f"PMODE|{sym_type}|scalp"},
+                {"text": "🌊 دخول وأهداف سوينق ($15/$30/$60)", "callback_data": f"PMODE|{sym_type}|swing"}
             ]
         ]
     }
@@ -647,7 +647,7 @@ def evaluate_multi_strategies(ltf, htf, div_info, bos_events, vp_data):
         "s1_status": s1_status, "s2_status": s2_status, "s3_status": s3_status, "s4_status": s4_status, "s5_status": s5_status
     }
 
-# ==================== 5. كشف الدايفرجنس وهيكل السوق و OTE ====================
+# ==================== 5. كشف الدايفرجنس وهيكل السوق ومحرك الاقتناص القريب الذكي ====================
 def detect_rsi_macd_divergence(plot_df):
     n = len(plot_df)
     if n < 20:
@@ -710,47 +710,162 @@ def detect_bos_choch(plot_df):
         events.append({"type": "BOS/CHoCH", "bias": "BEAR", "level": piv_lows[-2][1], "text": "BOS/CHoCH BEAR", "color": "#ff5252"})
     return events
 
-def analyze_structure_and_ote(df, is_long_bias=True):
-    recent = df.tail(55).reset_index(drop=True)
-    curr_price = float(recent["close"].iloc[-1])
-    atr = max(float(recent["ATR"].iloc[-1]), curr_price * 0.001)
-    swing_high = float(recent["high"].max())
-    swing_low = float(recent["low"].min())
-    if swing_high - swing_low < (1.5 * atr):
-        swing_high = curr_price + (2.5 * atr)
-        swing_low = curr_price - (2.5 * atr)
+def analyze_structure_and_ote(df, is_long_bias=True, sym_type="GOLD", vp_data=None):
+    """
+    محرك الاقتناص القريب الذكي (Smart Proximity Entry):
+    - يبحث عن أقرب ارتكاز مؤسسي منطقي (EMA 20 / VWAP / POC / Micro FVG / 38.2%-50% Micro Wave).
+    - في السكالب (الذهب): يضع منطقة الدخول على بُعد 1.0$ إلى 2.2$ فقط من السعر الحالي.
+    - في السوينق (الذهب): يضع منطقة الدخول على بُعد 4.0$ إلى 8.0$ من السعر الحالي.
+    """
+    recent_55 = df.tail(55).reset_index(drop=True)
+    curr_row = recent_55.iloc[-1]
+    curr_price = float(curr_row["close"])
+    atr = max(float(curr_row["ATR"]), curr_price * 0.0008)
+    rsi = float(curr_row["RSI"])
 
-    total_range = swing_high - swing_low
-    eq_50 = round(swing_low + (0.50 * total_range), 2)
-    bull_ote_618 = round(swing_high - (0.618 * total_range), 2)
-    bull_ote_705 = round(swing_high - (0.705 * total_range), 2)
-    bull_ote_786 = round(swing_high - (0.786 * total_range), 2)
+    # السيولة الكلية ومناطق العرض والطلب للرسم العام على الشارت
+    swing_high_55 = float(recent_55["high"].max())
+    swing_low_55 = float(recent_55["low"].min())
+    if swing_high_55 - swing_low_55 < (1.5 * atr):
+        swing_high_55 = curr_price + (2.5 * atr)
+        swing_low_55 = curr_price - (2.5 * atr)
 
-    bear_ote_618 = round(swing_low + (0.618 * total_range), 2)
-    bear_ote_705 = round(swing_low + (0.705 * total_range), 2)
-    bear_ote_786 = round(swing_low + (0.786 * total_range), 2)
+    eq_50 = round(swing_low_55 + 0.50 * (swing_high_55 - swing_low_55), 2)
+    demand_bottom = round(swing_low_55, 2)
+    demand_top = round(swing_low_55 + (0.6 * atr), 2)
+    supply_bottom = round(swing_high_55 - (0.6 * atr), 2)
+    supply_top = round(swing_high_55, 2)
 
-    demand_bottom, demand_top = max(swing_low, bull_ote_786 - (0.2 * atr)), max(swing_low + (0.5 * atr), bull_ote_618)
-    supply_bottom, supply_top = min(swing_high - (0.5 * atr), bear_ote_618), min(swing_high, bear_ote_786 + (0.2 * atr))
+    # تحديد نافذة القرب المسموحة حسب النمط (سكالب أم سوينق) وحسب الأصل (ذهب أم بيتكوين)
+    is_swing_mode = (user_settings.get("profit_style") == "swing") or (user_settings.get("ltf") in ["4h", "1d"])
+    micro_window = 22 if is_swing_mode else 12
+    micro_df = df.tail(micro_window).reset_index(drop=True)
 
-    half_band = 0.15 * atr
-    if is_long_bias:
-        ote_zone = (bull_ote_786, bull_ote_618)
-        ote_sweet = bull_ote_705
-        sniper_zone = (round(ote_sweet - half_band, 2), round(ote_sweet + half_band, 2))
+    micro_high = float(micro_df["high"].max())
+    micro_low = float(micro_df["low"].min())
+    micro_span = max(micro_high - micro_low, atr)
+
+    if sym_type == "GOLD":
+        if is_swing_mode:
+            min_dist, ideal_dist, max_dist = 3.8, 5.5, 8.0
+            half_band = 0.85
+        else:
+            # مسافة السكالب في الذهب: قريبة جداً (1 إلى 2 دولار عن السعر الحالي)
+            min_dist, ideal_dist, max_dist = 0.9, 1.45, 2.15
+            half_band = 0.40
     else:
-        ote_zone = (bear_ote_618, bear_ote_786)
-        ote_sweet = bear_ote_705
-        sniper_zone = (round(ote_sweet - half_band, 2), round(ote_sweet + half_band, 2))
+        # للبيتكوين (نسبة من مؤشر التذبذب ATR)
+        if is_swing_mode:
+            min_dist, ideal_dist, max_dist = 0.45 * atr, 0.70 * atr, 1.05 * atr
+            half_band = 0.18 * atr
+        else:
+            min_dist, ideal_dist, max_dist = 0.18 * atr, 0.32 * atr, 0.50 * atr
+            half_band = 0.10 * atr
+
+    # جمع المستويات الفنية المنطقية القريبة من السعر الحالي (Confluence Anchors)
+    ema20_val = float(curr_row["EMA_20"])
+    ema50_val = float(curr_row["EMA_50"])
+    vwap_val = float(curr_row["VWAP"])
+    poc_val = float(vp_data["poc"]) if vp_data and "poc" in vp_data else curr_price
+
+    # فحص آخر فجوة سعرية مصغرة (Micro FVG) أو شمعة ارتكاز في آخر 12 شمعة
+    micro_fvg_anchor = None
+    for i in range(len(micro_df) - 1, 1, -1):
+        c1, c3 = micro_df.iloc[i - 2], micro_df.iloc[i]
+        if is_long_bias and float(c3["low"]) > float(c1["high"]) and float(c3["low"]) <= curr_price:
+            micro_fvg_anchor = (float(c1["high"]) + float(c3["low"])) / 2.0
+            break
+        elif (not is_long_bias) and float(c3["high"]) < float(c1["low"]) and float(c3["high"]) >= curr_price:
+            micro_fvg_anchor = (float(c3["high"]) + float(c1["low"])) / 2.0
+            break
+
+    candidates = []
+    if is_long_bias:
+        # مستويات الشراء المنطقية أسفل السعر الحالي
+        fib_382 = curr_price - (0.382 * micro_span)
+        fib_500 = curr_price - (0.500 * micro_span)
+        prev_candle_low = float(micro_df["low"].iloc[-2]) if len(micro_df) >= 2 else (curr_price - ideal_dist)
+
+        raw_ anchors = [
+            (ema20_val, "ارتكاز المتوسط السريع EMA 20"),
+            (vwap_val, "خط السيولة المؤسسي VWAP"),
+            (poc_val, "نقطة التحكم بالحجم POC"),
+            (fib_382, "تصحيح فيبوناتشي القريب 38.2%"),
+            (fib_500, "توازن الموجة الفرعية 50%"),
+            (prev_candle_low, "سحب سيولة الشمعة السابقة")
+        ]
+        if micro_fvg_anchor is not None:
+            raw_anchors.insert(0, (micro_fvg_anchor, "فجوة سعرية فرعية Micro FVG"))
+
+        for lvl, reason_txt in raw_anchors:
+            dist = curr_price - lvl
+            if (min_dist * 0.65) <= dist <= (max_dist * 1.15):
+                candidates.append((lvl, dist, reason_txt))
+
+        if candidates:
+            # اختيار المستوى الأقرب للمسافة المثالية
+            best_lvl, _, anchor_reason = min(candidates, key=lambda x: abs(x[1] - ideal_dist))
+            # إذا كان RSI متشبعاً شرائياً (> 68) نبعد الدخول قليلاً ضمن النافذة المسموحة لمنع المجازفة
+            if rsi > 68:
+                best_lvl = min(best_lvl, curr_price - ideal_dist)
+            sniper_mid = max(curr_price - max_dist, min(curr_price - min_dist, best_lvl))
+        else:
+            # إذا لم يقع أي مؤشر داخل النافذة الضيقة، نضع الدخول عند المسافة المثالية المحسوبة
+            pullback_d = max_dist if rsi > 68 else ideal_dist
+            sniper_mid = curr_price - pullback_d
+            anchor_reason = "تراجع تصحيحي آمن (Micro OTE Pullback)"
+
+    else:
+        # مستويات البيع المنطقية أعلى السعر الحالي
+        fib_382 = curr_price + (0.382 * micro_span)
+        fib_500 = curr_price + (0.500 * micro_span)
+        prev_candle_high = float(micro_df["high"].iloc[-2]) if len(micro_df) >= 2 else (curr_price + ideal_dist)
+
+        raw_anchors = [
+            (ema20_val, "مقاومة المتوسط السريع EMA 20"),
+            (vwap_val, "خط السيولة المؤسسي VWAP"),
+            (poc_val, "نقطة التحكم بالحجم POC"),
+            (fib_382, "تصحيح فيبوناتشي القريب 38.2%"),
+            (fib_500, "توازن الموجة الفرعية 50%"),
+            (prev_candle_high, "سحب سيولة قمة الشمعة السابقة")
+        ]
+        if micro_fvg_anchor is not None:
+            raw_anchors.insert(0, (micro_fvg_anchor, "فجوة سعرية فرعية Micro FVG"))
+
+        for lvl, reason_txt in raw_anchors:
+            dist = lvl - curr_price
+            if (min_dist * 0.65) <= dist <= (max_dist * 1.15):
+                candidates.append((lvl, dist, reason_txt))
+
+        if candidates:
+            best_lvl, _, anchor_reason = min(candidates, key=lambda x: abs(x[1] - ideal_dist))
+            if rsi < 32:
+                best_lvl = max(best_lvl, curr_price + ideal_dist)
+            sniper_mid = min(curr_price + max_dist, max(curr_price + min_dist, best_lvl))
+        else:
+            pullback_d = max_dist if rsi < 32 else ideal_dist
+            sniper_mid = curr_price + pullback_d
+            anchor_reason = "ارتداد تصحيحي آمن (Micro OTE Pullback)"
+
+    sniper_mid = round(sniper_mid, 2)
+    sniper_zone = (round(sniper_mid - half_band, 2), round(sniper_mid + half_band, 2))
+    ote_zone = (round(sniper_mid - (1.4 * half_band), 2), round(sniper_mid + (1.4 * half_band), 2))
+    dist_from_curr = round(abs(curr_price - sniper_mid), 2)
 
     return {
-        "bsl": round(swing_high, 2), "ssl": round(swing_low, 2), "eq_50": eq_50,
-        "ote_zone": ote_zone, "ote_sweet": ote_sweet, "sniper_zone": sniper_zone,
-        "demand_zone": (round(demand_bottom, 2), round(demand_top, 2)),
-        "supply_zone": (round(supply_bottom, 2), round(supply_top, 2))
+        "bsl": round(swing_high_55, 2),
+        "ssl": round(swing_low_55, 2),
+        "eq_50": eq_50,
+        "ote_zone": ote_zone,
+        "ote_sweet": sniper_mid,
+        "sniper_zone": sniper_zone,
+        "anchor_reason": anchor_reason,
+        "dist_from_curr": dist_from_curr,
+        "demand_zone": (demand_bottom, demand_top),
+        "supply_zone": (supply_bottom, supply_top)
     }
 
-# ==================== 6. رسم الشارت المتكامل مع TP1 و TP2 و TP3 بالدولار ====================
+# ==================== 6. رسم الشارت المتكامل مع المنطقة القريبة و TP1 / TP2 / TP3 ====================
 def generate_chart_image(df, zones, vp_data, div_info, bos_events, asset_title, entry_zone, sl, exit_targets, usd_targets, is_long=True):
     try:
         plot_df = df.tail(55).reset_index(drop=True)
@@ -795,13 +910,14 @@ def generate_chart_image(df, zones, vp_data, div_info, bos_events, asset_title, 
 
         d_low, d_high = zones["demand_zone"]
         s_low, s_high = zones["supply_zone"]
-        ax.add_patch(patches.Rectangle((0, d_low), width=x_end, height=max(d_high - d_low, 1e-3), facecolor="#00e676", alpha=0.13, edgecolor="#00e676", linewidth=1, zorder=1))
-        ax.add_patch(patches.Rectangle((0, s_low), width=x_end, height=max(s_high - s_low, 1e-3), facecolor="#ff5252", alpha=0.13, edgecolor="#ff5252", linewidth=1, zorder=1))
+        ax.add_patch(patches.Rectangle((0, d_low), width=x_end, height=max(d_high - d_low, 1e-3), facecolor="#00e676", alpha=0.12, edgecolor="#00e676", linewidth=1, zorder=1))
+        ax.add_patch(patches.Rectangle((0, s_low), width=x_end, height=max(s_high - s_low, 1e-3), facecolor="#ff5252", alpha=0.12, edgecolor="#ff5252", linewidth=1, zorder=1))
 
+        # رسم مستطيل منطقة الدخول القريبة الذكية
         ote_low, ote_high = zones["ote_zone"]
-        ax.add_patch(patches.Rectangle((len(plot_df) - 28, ote_low), width=32, height=max(ote_high - ote_low, 1e-3), facecolor="#ffd700", alpha=0.24, edgecolor="#ffd700", linestyle="--", linewidth=1.3, zorder=2))
+        ax.add_patch(patches.Rectangle((len(plot_df) - 18, ote_low), width=22, height=max(ote_high - ote_low, 1e-3), facecolor="#ffd700", alpha=0.26, edgecolor="#ffd700", linestyle="--", linewidth=1.3, zorder=2))
         ax.axhline(zones["ote_sweet"], color="#ffd700", linestyle=":", linewidth=1.1, alpha=0.95)
-        ax.text(len(plot_df) - 27, zones["ote_sweet"], f" GOLDEN OTE | 70.5%: {zones['ote_sweet']}", color="#ffd700", fontsize=7.5, va="bottom", fontweight="bold")
+        ax.text(len(plot_df) - 17, zones["ote_sweet"], f" SMART ENTRY ZONE: {zones['ote_sweet']}", color="#ffd700", fontsize=7.5, va="bottom", fontweight="bold")
 
         for ev in bos_events:
             ax.axhline(ev["level"], color=ev["color"], linestyle="--", linewidth=1.1, alpha=0.9, zorder=4)
@@ -844,7 +960,7 @@ def generate_chart_image(df, zones, vp_data, div_info, bos_events, asset_title, 
             m_d = div_info["macd_div"]
             ax_macd.plot([m_d["x1"], m_d["x2"]], [m_d["v1"], m_d["v2"]], color=m_d["color"], linewidth=2.0, marker="o", markersize=3, zorder=6)
 
-        ax.set_title(f"{asset_title} | Targets: +${u1} / +${u2} / +${u3} (Lot: {user_settings['lot_size']}) | POC: {poc_p}", color="#ffffff", fontsize=9.5, fontweight="bold", pad=10)
+        ax.set_title(f"{asset_title} | Proximity Entry ({e_mid}) | Targets: +${u1} / +${u2} / +${u3}", color="#ffffff", fontsize=9.5, fontweight="bold", pad=10)
         for a in [ax, ax_rsi, ax_macd]:
             a.grid(color="#2a2e39", linestyle="--", linewidth=0.5, alpha=0.6)
             a.tick_params(colors="#b2b5be", labelsize=7.5)
@@ -862,7 +978,7 @@ def generate_chart_image(df, zones, vp_data, div_info, bos_events, asset_title, 
         plt.close("all")
         return None
 
-# ==================== 7. بناء خطة التداول بالأهداف الثلاثة بالدولار ($5 / $10 / $20) ====================
+# ==================== 7. بناء خطة التداول القريبة بالأهداف الثلاثة ($5 / $10 / $20) ====================
 def register_pending_trade(trade_key, asset_name, sym_type, is_long, entry_zone, sl, exit_targets, usd_targets, tf_label):
     with trades_lock:
         old = active_trades.get(trade_key)
@@ -915,7 +1031,7 @@ def analyze_and_send_zones(sym_type, ltf_str=None, chat_id=None, silent_register
     strat_matrix = evaluate_multi_strategies(ltf, htf, div_info, bos_events, vp_data)
     is_long = strat_matrix["is_long"]
 
-    zones = analyze_structure_and_ote(ltf, is_long)
+    zones = analyze_structure_and_ote(ltf, is_long, sym_type, vp_data)
     entry_zone = zones["sniper_zone"]
     poc_p = vp_data["poc"]
 
@@ -936,13 +1052,13 @@ def analyze_and_send_zones(sym_type, ltf_str=None, chat_id=None, silent_register
     entry_mid = round((entry_zone[0] + entry_zone[1]) / 2, 2)
 
     if is_long:
-        dir_label = "شراء معلق (BUY LIMIT) 🟢"
+        dir_label = "شراء قريب (BUY LIMIT) 🟢"
         sl = round(entry_mid - dist_sl, 2)
         tp1 = round(entry_mid + dist_tp1, 2)
         tp2 = round(entry_mid + dist_tp2, 2)
         tp3 = round(entry_mid + dist_tp3, 2)
     else:
-        dir_label = "بيع معلق (SELL LIMIT) 🔴"
+        dir_label = "بيع قريب (SELL LIMIT) 🔴"
         sl = round(entry_mid + dist_sl, 2)
         tp1 = round(entry_mid - dist_tp1, 2)
         tp2 = round(entry_mid - dist_tp2, 2)
@@ -955,13 +1071,15 @@ def analyze_and_send_zones(sym_type, ltf_str=None, chat_id=None, silent_register
     if silent_register_only:
         return
 
-    style_name = "سكالبينج سريع ⚡" if user_settings["profit_style"] == "scalp" else ("سوينق بعيد 🌊" if user_settings["profit_style"] == "swing" else "مخصص ⚙️")
+    style_name = "سكالبينج قريب ⚡" if user_settings["profit_style"] == "scalp" else ("سوينق بعيد 🌊" if user_settings["profit_style"] == "swing" else "مخصص ⚙️")
+    in_zone_now = entry_zone[0] <= curr_price <= entry_zone[1]
+    prox_txt = "🔥 السعر داخل منطقة الدخول الآن!" if in_zone_now else f"⏳ تبعد `{zones['dist_from_curr']}$` فقط عن السعر الحالي"
 
     caption = (
-        f"⚡ *تقرير القناص الاحترافي (أهداف بالدولار TP1 / TP2 / TP3):*\n"
+        f"⚡ *تقرير القناص القريب والآمن (Smart Proximity):*\n"
         f"📊 *الأصل:* `{asset_name}` | *الفريم:* `{ltf_use}` (الأكبر `{htf_use}`)\n"
         f"💵 *السعر الحالي:* `{curr_price}` | *التوافق:* `{strat_matrix['aligned_count']}/5` (`{strat_matrix['confidence']}%`)\n"
-        f"💼 *نمط الربح:* `{style_name}` | *حجم اللوت:* `{lot}`\n"
+        f"💼 *نمط الدخول والربح:* `{style_name}` | *اللوت:* `{lot}`\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📋 *مصفوفة الاستراتيجيات الخمس:*\n"
         f"1️⃣ *SMC + OTE:* {strat_matrix['s1_status']}\n"
@@ -972,8 +1090,9 @@ def analyze_and_send_zones(sym_type, ltf_str=None, chat_id=None, silent_register
         f"🧬 *الدايفرجنس (RSI/MACD):* {div_info['text']}\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📌 *القرار الموحد:* {dir_label}\n"
-        f"🏛 *ارتكاز السيولة (POC):* `{poc_p}`\n"
-        f"🎯 *منطقة الدخول القناصة:* `{entry_zone[0]}` إلى `{entry_zone[1]}` (المنتصف: `{entry_mid}`)\n"
+        f"🛡️ *سبب اختيار المنطقة:* `{zones['anchor_reason']}`\n"
+        f"📏 *قرب الصفقة:* {prox_txt}\n"
+        f"🎯 *منطقة الدخول القريبة:* `{entry_zone[0]}` إلى `{entry_zone[1]}` (المنتصف: `{entry_mid}`)\n"
         f"🛑 *وقف الخسارة (SL = -${u_sl}):* `{sl}`\n"
         f"✅ *الهدف الأول (TP1 = +${u_tp1}):* `{tp1}`\n"
         f"🔥 *الهدف الثاني (TP2 = +${u_tp2}):* `{tp2}`\n"
@@ -1026,8 +1145,8 @@ def trade_tracker_loop():
                             with trades_lock:
                                 if k in active_trades:
                                     active_trades[k]["voice_alert_sent"] = True
-                            speech_txt = f"تنبيه هام من بوت التداول. وصل سعر {arabic_name} الآن إلى منطقة الدخول الذهبية عند مستوى {int(curr_p)} لصفقة {dir_word}."
-                            caption_txt = f"🗣️ *تنبيه صوتي ناطق: وصل سعر {arabic_name} إلى منطقة الدخول!*\n🎯 المنطقة: `{t['entry_low']} - {t['entry_high']}` | السعر: `{curr_p}`"
+                            speech_txt = f"تنبيه هام من بوت التداول. وصل سعر {arabic_name} الآن إلى منطقة الدخول القريبة عند مستوى {int(curr_p)} لصفقة {dir_word}."
+                            caption_txt = f"🗣️ *تنبيه صوتي ناطق: وصل سعر {arabic_name} إلى منطقة الدخول القريبة!*\n🎯 المنطقة: `{t['entry_low']} - {t['entry_high']}` | السعر: `{curr_p}`"
                             send_arabic_voice_alert(speech_txt, caption_txt)
 
                     if t["status"] == "PENDING":
@@ -1184,7 +1303,7 @@ def format_active_trades_report():
         if not active_trades:
             return "📂 *لا توجد صفقات نشطة حالياً.*"
         snap = dict(active_trades)
-    lines = ["📂 *المناطق المراقبة تلقائياً (أهداف بالدولار TP1 / TP2 / TP3):*\n━━━━━━━━━━━━━━━━━━"]
+    lines = ["📂 *المناطق القريبة المراقبة تلقائياً (TP1 / TP2 / TP3):*\n━━━━━━━━━━━━━━━━━━"]
     for k, t in snap.items():
         st = "⏳ بانتظار الملامسة" if t["status"] == "PENDING" else "🔥 مفعل بالسوق"
         lines.append(
@@ -1379,7 +1498,6 @@ def telegram_listener():
                                     send_msg("🔒 *هذا البوت خاص ومحمي بكلمة سر.*\n🔑 يرجى إرسال **كلمة السر الصحيحة**:", chat_id, remove_keyboard=True)
                                 continue
 
-                        # أوامر التحكم في الأرباح واللوت للمستخدمين المصرح لهم
                         if text.startswith("/settp "):
                             try:
                                 nums = [float(x) for x in text.replace("/settp ", "").split() if x.strip()]
@@ -1423,8 +1541,9 @@ def telegram_listener():
 
                         if text in ["/start", "/help"]:
                             send_msg(
-                                "🤖 *أهلاً بك في نظام القناص (TP1 = $5 | TP2 = $10 | TP3 = $20)!*\n"
-                                "يمكنك التبديل في أي وقت بين ربح السكالب السريع وربح السوينق البعيد من الأزرار بالأسفل.",
+                                "🤖 *أهلاً بك في نظام الاقتناص القريب (Smart Proximity Entry)!*\n"
+                                "• في السكالب: مناطق الدخول تبعد `1$ إلى 2$` فقط في الذهب عند أقرب ارتكاز آمن.\n"
+                                "• في السوينق: مناطق الدخول أوسع قليلاً (`4$ إلى 8$`) مع أهداف سوينق كبيرة.",
                                 chat_id
                             )
                         elif text in ["⚙️ إعدادات الربح واللوت", "/settings"]:
@@ -1432,34 +1551,36 @@ def telegram_listener():
                         elif text in ["🎯 ربح سكالب ($5/$10/$20)", "/scalp_profit"]:
                             apply_profit_profile("scalp")
                             send_msg(
-                                "🎯 *تم تفعيل نمط ربح السكالبينج السريع:*\n"
-                                "• TP1 = `+$5` | TP2 = `+$10` | TP3 = `+$20` | SL = `-$5`",
+                                "🎯 *تم تفعيل نمط السكالبينج القريب:*\n"
+                                "• مسافة الدخول في الذهب: `1$ - 2$` عن السعر الحالي.\n"
+                                "• الأهداف: TP1 = `+$5` | TP2 = `+$10` | TP3 = `+$20` | SL = `-$5`",
                                 chat_id
                             )
                         elif text in ["🌊 ربح سوينق بعيد ($15/$30/$60)", "/swing_profit"]:
                             apply_profit_profile("swing")
                             send_msg(
-                                "🌊 *تم تفعيل نمط ربح السوينق البعيد:*\n"
-                                "• TP1 = `+$15` | TP2 = `+$30` | TP3 = `+$60` | SL = `-$12`",
+                                "🌊 *تم تفعيل نمط السوينق البعيد:*\n"
+                                "• مسافة الدخول في الذهب: `4$ - 8$` عن السعر الحالي.\n"
+                                "• الأهداف: TP1 = `+$15` | TP2 = `+$30` | TP3 = `+$60` | SL = `-$12`",
                                 chat_id
                             )
                         elif text in ["🔊 تجربة الناطق العربي", "/sound"]:
                             test_speech = (
-                                f"أهلاً بك، تم ضبط الأهداف حالياً على {int(user_settings['tp1_usd'])} دولار للهدف الأول، "
+                                f"أهلاً بك، تم تفعيل نظام مناطق الدخول القريبة والآمنة، مع أهداف {int(user_settings['tp1_usd'])} دولار للهدف الأول، "
                                 f"و {int(user_settings['tp2_usd'])} دولار للهدف الثاني، و {int(user_settings['tp3_usd'])} دولار للهدف الثالث."
                             )
                             send_arabic_voice_alert(test_speech, "🗣️ *تجربة الناطق الصوتي باللغة العربية*", chat_id)
                         elif text in ["⚡ فريم سكالب (5m)", "/scalp"]:
                             user_settings.update({"mode_name": TIMEFRAME_MODES["scalp"]["name"], "ltf": "5m", "htf": "15m"})
                             apply_profit_profile("scalp")
-                            send_msg("⚡ تم تفعيل فريم 5 دقائق مع أهداف سكالب ($5 / $10 / $20).", chat_id)
+                            send_msg("⚡ تم تفعيل فريم 5 دقائق مع دخول قريب جداً (`1$ - 2$`) وأهداف سكالب ($5 / $10 / $20).", chat_id)
                         elif text in ["⏱ فريم متوسط (15m)", "/intraday"]:
                             user_settings.update({"mode_name": TIMEFRAME_MODES["intraday"]["name"], "ltf": "15m", "htf": "4h"})
                             send_msg("⏱ تم تفعيل الفريم المتوسط 15 دقيقة.", chat_id)
                         elif text in ["🌊 فريم طويل (4h/1d)", "/swing"]:
                             user_settings.update({"mode_name": TIMEFRAME_MODES["swing"]["name"], "ltf": "4h", "htf": "1d"})
                             apply_profit_profile("swing")
-                            send_msg("🌊 تم تفعيل الفريم الطويل 4 ساعات مع أهداف سوينق بعيدة ($15 / $30 / $60).", chat_id)
+                            send_msg("🌊 تم تفعيل الفريم الطويل 4 ساعات مع دخول سوينق متوازن وأهداف ($15 / $30 / $60).", chat_id)
                         elif text in ["/gold", "🪙 مناطق دخول الذهب"]:
                             analyze_and_send_zones("GOLD", user_settings["ltf"], chat_id)
                         elif text in ["/btc", "₿ مناطق دخول البيتكوين"]:
@@ -1479,7 +1600,7 @@ def telegram_listener():
 
 @app.route("/")
 def home():
-    return "Persistent Users + Dynamic USD Targets ($5/$10/$20) Bot is Live 24/7!"
+    return "Smart Proximity Entry + Dynamic USD Targets Bot is Live 24/7!"
 
 @app.route("/health")
 def health():
@@ -1513,8 +1634,9 @@ if __name__ == "__main__":
     threading.Thread(target=trade_tracker_loop, daemon=True).start()
     threading.Thread(target=keep_alive_pinger, daemon=True).start()
     send_msg(
-        "🚀 *تم تشغيل البوت بنظام الأهداف الثلاثة بالدولار ($5 / $10 / $20) والتحكم بين السكالب والسوينق!*\n"
-        "• يمكنك التبديل الفوري من الأزرار أو إرسال `/settp 5 10 20` و `/setlot 0.01`."
+        "🎯 *تم تفعيل محرك الاقتناص القريب والآمن (Smart Proximity Entry)!*\n"
+        "• في نمط السكالب: مناطق دخول الذهب أصبحت تبعد **`1$ إلى 2$` فقط** عند أقرب ارتكاز مؤسسي.\n"
+        "• في نمط السوينق: مناطق الدخول أوسع قليلاً (`4$ إلى 8$`) لتناسب الصفقات الطويلة."
     )
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)

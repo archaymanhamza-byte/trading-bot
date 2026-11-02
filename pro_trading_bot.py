@@ -37,14 +37,14 @@ trades_lock = threading.Lock()
 
 # ==================== نظام الحفظ الدائم (Persistent Storage) ====================
 USERS_FILE = "users_store.json"
-users_lock = threading.Lock()
+users_lock = threading.RLock()  # RLock لمنع التجمّد عند استدعاء الحفظ داخل القفل
 
 def load_users_from_disk():
     default_db = {
         "approved": {},
         "pending": {},
-        "notified_visitors": [],
-        "banned": [],
+        "notified_visitors": set(),
+        "banned": set(),
         "global_enabled": True,
         "password": BOT_PASSWORD,
         "admin_email": ADMIN_EMAIL
@@ -53,9 +53,13 @@ def load_users_from_disk():
         try:
             with open(USERS_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                # تحويل القوائم المخزنة إلى مجموعات (Sets)
+                data["approved"] = data.get("approved", {})
+                data["pending"] = data.get("pending", {})
                 data["banned"] = set(data.get("banned", []))
                 data["notified_visitors"] = set(data.get("notified_visitors", []))
+                data["global_enabled"] = data.get("global_enabled", True)
+                data["password"] = data.get("password", BOT_PASSWORD)
+                data["admin_email"] = data.get("admin_email", ADMIN_EMAIL)
                 return data
         except Exception as e:
             print(f"Error loading users store: {e}")
@@ -300,22 +304,31 @@ def send_photo_msg(photo_buf, caption, sym_type="GOLD", chat_id=None):
 
 # ==================== 3. جلب البيانات وحساب المؤشرات + Volume Profile POC ====================
 def clean_yf_dataframe(raw):
-    if raw is None or raw.empty: return pd.DataFrame()
-    if isinstance(raw.columns, pd.MultiIndex): raw.columns = raw.columns.get_level_values(0)
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+    if isinstance(raw.columns, pd.MultiIndex):
+        raw.columns = raw.columns.get_level_values(0)
     raw = raw.reset_index()
     col_map = {}
     for c in raw.columns:
         cl = str(c).lower()
-        if cl in ["datetime", "date", "index"]: col_map[c] = "timestamp"
-        elif cl == "open": col_map[c] = "open"
-        elif cl == "high": col_map[c] = "high"
-        elif cl == "low": col_map[c] = "low"
-        elif cl == "close": col_map[c] = "close"
-        elif cl == "volume": col_map[c] = "volume"
+        if cl in ["datetime", "date", "index"]:
+            col_map[c] = "timestamp"
+        elif cl == "open":
+            col_map[c] = "open"
+        elif cl == "high":
+            col_map[c] = "high"
+        elif cl == "low":
+            col_map[c] = "low"
+        elif cl == "close":
+            col_map[c] = "close"
+        elif cl == "volume":
+            col_map[c] = "volume"
     raw = raw.rename(columns=col_map)
     needed = ["timestamp", "open", "high", "low", "close", "volume"]
     for col in needed:
-        if col not in raw.columns: raw[col] = 0.0
+        if col not in raw.columns:
+            raw[col] = 0.0
     return raw[needed].dropna(subset=["open", "high", "low", "close"])
 
 def get_btc_ohlcv(timeframe, limit=220):
@@ -335,18 +348,23 @@ def get_btc_ohlcv(timeframe, limit=220):
 def get_yf_asset_ohlcv(ticker_sym, timeframe):
     try:
         ticker = yf.Ticker(ticker_sym)
-        if timeframe == "1d": return clean_yf_dataframe(ticker.history(period="1y", interval="1d"))
+        if timeframe == "1d":
+            return clean_yf_dataframe(ticker.history(period="1y", interval="1d"))
         elif timeframe == "4h":
             raw = clean_yf_dataframe(ticker.history(period="60d", interval="1h"))
             if not raw.empty:
                 raw.set_index("timestamp", inplace=True)
                 return raw.resample("4h").agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}).dropna().reset_index()
-        elif timeframe == "1h": return clean_yf_dataframe(ticker.history(period="30d", interval="1h"))
-        elif timeframe == "15m": return clean_yf_dataframe(ticker.history(period="15d", interval="15m"))
-        elif timeframe == "5m": return clean_yf_dataframe(ticker.history(period="5d", interval="5m"))
+        elif timeframe == "1h":
+            return clean_yf_dataframe(ticker.history(period="30d", interval="1h"))
+        elif timeframe == "15m":
+            return clean_yf_dataframe(ticker.history(period="15d", interval="15m"))
+        elif timeframe == "5m":
+            return clean_yf_dataframe(ticker.history(period="5d", interval="5m"))
         elif timeframe == "1m":
             df = clean_yf_dataframe(ticker.history(period="5d", interval="1m"))
-            if len(df) > 35: return df
+            if len(df) > 35:
+                return df
             return clean_yf_dataframe(ticker.history(period="5d", interval="5m"))
     except Exception:
         pass
@@ -355,7 +373,8 @@ def get_yf_asset_ohlcv(ticker_sym, timeframe):
 def get_gold_ohlcv(timeframe):
     for sym in ["GC=F", "XAUUSD=X"]:
         df = get_yf_asset_ohlcv(sym, timeframe)
-        if not df.empty and len(df) > 35: return df
+        if not df.empty and len(df) > 35:
+            return df
     return pd.DataFrame()
 
 def calc_parabolic_sar(df, af_start=0.02, af_step=0.02, af_max=0.20):
@@ -563,7 +582,7 @@ def evaluate_multi_strategies(ltf, htf, div_info, bos_events, vp_data):
     s4_status = f"🟢 أعلى VWAP (`{vwap_val}`) | {sq_txt}" if vwap_bull else f"🔴 أسفل VWAP (`{vwap_val}`) | {sq_txt}"
 
     s5_bull = poc_bull
-    vp_loc = f"اختراق شرائي أعلى VAH" if price > vah_val else (f"كسر بيعي أسفل VAL" if price < val_val else f"داخل منطقة القيمة")
+    vp_loc = "اختراق شرائي أعلى VAH" if price > vah_val else ("كسر بيعي أسفل VAL" if price < val_val else "داخل منطقة القيمة")
     s5_status = f"🟢 ارتكاز أعلى POC (`{poc_val}`) — {vp_loc}" if s5_bull else f"🔴 ضغط أسفل POC (`{poc_val}`) — {vp_loc}"
 
     bull_votes = sum([1 if s1_bull else 0, 1 if s2_bull else 0, 1 if s3_bull else 0, 1 if s4_bull else 0, 1 if s5_bull else 0])
@@ -589,14 +608,17 @@ def evaluate_multi_strategies(ltf, htf, div_info, bos_events, vp_data):
 # ==================== 5. كشف الدايفرجنس وهيكل السوق و OTE ====================
 def detect_rsi_macd_divergence(plot_df):
     n = len(plot_df)
-    if n < 20: return {"found": False, "text": "حيادي", "rsi_div": None, "macd_div": None}
+    if n < 20:
+        return {"found": False, "text": "حيادي", "rsi_div": None, "macd_div": None}
     piv_lows, piv_highs = [], []
     for i in range(2, n - 1):
         l, h = float(plot_df["low"].iloc[i]), float(plot_df["high"].iloc[i])
         if l <= float(plot_df["low"].iloc[i-1]) and l <= float(plot_df["low"].iloc[i-2]) and l <= float(plot_df["low"].iloc[i+1]):
-            if not piv_lows or (i - piv_lows[-1]) >= 4: piv_lows.append(i)
+            if not piv_lows or (i - piv_lows[-1]) >= 4:
+                piv_lows.append(i)
         if h >= float(plot_df["high"].iloc[i-1]) and h >= float(plot_df["high"].iloc[i-2]) and h >= float(plot_df["high"].iloc[i+1]):
-            if not piv_highs or (i - piv_highs[-1]) >= 4: piv_highs.append(i)
+            if not piv_highs or (i - piv_highs[-1]) >= 4:
+                piv_highs.append(i)
 
     rsi_res, macd_res = None, None
     if len(piv_lows) >= 2:
@@ -620,19 +642,25 @@ def detect_rsi_macd_divergence(plot_df):
             macd_res = {"found": True, "bias": "BEAR", "label": "MACD Bear Div", "x1": i1, "x2": i2, "p1": p1, "p2": p2, "v1": m1, "v2": m2, "color": "#ff5252"}
 
     txt = "حيادي"
-    if rsi_res and macd_res: txt = "🌟 دايفرجنس مزدوج مؤكد (RSI + MACD)"
-    elif rsi_res: txt = f"🟢 دايفرجنس RSI ({rsi_res['label']})"
-    elif macd_res: txt = f"🔵 دايفرجنس MACD ({macd_res['label']})"
+    if rsi_res and macd_res:
+        txt = "🌟 دايفرجنس مزدوج مؤكد (RSI + MACD)"
+    elif rsi_res:
+        txt = f"🟢 دايفرجنس RSI ({rsi_res['label']})"
+    elif macd_res:
+        txt = f"🔵 دايفرجنس MACD ({macd_res['label']})"
     return {"found": bool(rsi_res or macd_res), "text": txt, "rsi_div": rsi_res, "macd_div": macd_res}
 
 def detect_bos_choch(plot_df):
     n = len(plot_df)
-    if n < 15: return []
+    if n < 15:
+        return []
     piv_highs, piv_lows = [], []
     for i in range(2, n - 1):
         h, l = float(plot_df["high"].iloc[i]), float(plot_df["low"].iloc[i])
-        if h >= float(plot_df["high"].iloc[i-1]) and h >= float(plot_df["high"].iloc[i-2]) and h >= float(plot_df["high"].iloc[i+1]): piv_highs.append((i, h))
-        if l <= float(plot_df["low"].iloc[i-1]) and l <= float(plot_df["low"].iloc[i-2]) and l <= float(plot_df["low"].iloc[i+1]): piv_lows.append((i, l))
+        if h >= float(plot_df["high"].iloc[i-1]) and h >= float(plot_df["high"].iloc[i-2]) and h >= float(plot_df["high"].iloc[i+1]):
+            piv_highs.append((i, h))
+        if l <= float(plot_df["low"].iloc[i-1]) and l <= float(plot_df["low"].iloc[i-2]) and l <= float(plot_df["low"].iloc[i+1]):
+            piv_lows.append((i, l))
     events = []
     if len(piv_highs) >= 2 and float(plot_df["close"].iloc[-1]) > piv_highs[-2][1]:
         events.append({"type": "BOS/CHoCH", "bias": "BULL", "level": piv_highs[-2][1], "text": "BOS/CHoCH BULL", "color": "#00e676"})
@@ -689,7 +717,8 @@ def generate_chart_image(df, zones, vp_data, div_info, bos_events, asset_title, 
             gridspec_kw={"height_ratios": [3.4, 1.0, 1.0], "hspace": 0.08}
         )
         fig.patch.set_facecolor("#131722")
-        for a in [ax, ax_rsi, ax_macd]: a.set_facecolor("#131722")
+        for a in [ax, ax_rsi, ax_macd]:
+            a.set_facecolor("#131722")
 
         max_v = max(vp_data["bin_volumes"]) if vp_data["bin_volumes"] else 1.0
         for b_i, (b_center, b_vol) in enumerate(zip(vp_data["bin_centers"], vp_data["bin_volumes"])):
@@ -773,7 +802,8 @@ def generate_chart_image(df, zones, vp_data, div_info, bos_events, asset_title, 
         for a in [ax, ax_rsi, ax_macd]:
             a.grid(color="#2a2e39", linestyle="--", linewidth=0.5, alpha=0.6)
             a.tick_params(colors="#b2b5be", labelsize=7.5)
-            for spine in a.spines.values(): spine.set_color("#2a2e39")
+            for spine in a.spines.values():
+                spine.set_color("#2a2e39")
 
         plt.tight_layout()
         buf = io.BytesIO()
@@ -895,23 +925,29 @@ def auto_zone_scanner_loop():
 
 def get_latest_price_extremes(symbol_type):
     df = get_btc_ohlcv("1m", limit=3) if symbol_type == "BTC" else get_gold_ohlcv("5m")
-    if df.empty: return None
+    if df.empty:
+        return None
     last = df.iloc[-1]
     return {"close": round(float(last["close"]), 2), "high": round(float(last["high"]), 2), "low": round(float(last["low"]), 2)}
 
 def trade_tracker_loop():
     while True:
         try:
-            with trades_lock: keys = list(active_trades.keys())
+            with trades_lock:
+                keys = list(active_trades.keys())
             if keys:
                 cache = {}
                 for k in keys:
-                    with trades_lock: t = active_trades.get(k)
-                    if not t: continue
+                    with trades_lock:
+                        t = active_trades.get(k)
+                    if not t:
+                        continue
                     sym = t["symbol_type"]
-                    if sym not in cache: cache[sym] = get_latest_price_extremes(sym)
+                    if sym not in cache:
+                        cache[sym] = get_latest_price_extremes(sym)
                     p = cache[sym]
-                    if not p: continue
+                    if not p:
+                        continue
                     high_p, low_p, curr_p = p["high"], p["low"], p["close"]
                     arabic_name = "الذهب" if sym == "GOLD" else "البيتكوين"
                     dir_word = "شراء" if t["is_long"] else "بيع"
@@ -919,7 +955,8 @@ def trade_tracker_loop():
                     if not t.get("voice_alert_sent", False):
                         if low_p <= t["entry_high"] and high_p >= t["entry_low"]:
                             with trades_lock:
-                                if k in active_trades: active_trades[k]["voice_alert_sent"] = True
+                                if k in active_trades:
+                                    active_trades[k]["voice_alert_sent"] = True
                             speech_txt = f"تنبيه هام من بوت التداول. وصل سعر {arabic_name} الآن إلى منطقة الدخول الذهبية عند مستوى {int(curr_p)} لصفقة {dir_word}."
                             caption_txt = f"🗣️ *تنبيه صوتي ناطق: وصل سعر {arabic_name} إلى منطقة الدخول!*\n🎯 المنطقة: `{t['entry_low']} - {t['entry_high']}` | السعر: `{curr_p}`"
                             send_arabic_voice_alert(speech_txt, caption_txt)
@@ -927,13 +964,15 @@ def trade_tracker_loop():
                     if t["status"] == "PENDING":
                         if low_p <= t["entry_high"] and high_p >= t["entry_low"]:
                             with trades_lock:
-                                if k in active_trades: active_trades[k]["status"] = "ACTIVE"
+                                if k in active_trades:
+                                    active_trades[k]["status"] = "ACTIVE"
                         continue
 
                     if t["is_long"]:
                         if high_p >= t["tp2"]:
                             send_arabic_voice_alert(f"مبروك، حقق سعر {arabic_name} الهدف الثاني السريع بالكامل.", f"🚀 *مبروك! تحقق الهدف الثاني السريع (2R: {t['tp2']}) للأصل {t['asset']}!*")
-                            with trades_lock: active_trades.pop(k, None)
+                            with trades_lock:
+                                active_trades.pop(k, None)
                         elif (not t["tp1_hit"]) and high_p >= t["tp1"]:
                             with trades_lock:
                                 if k in active_trades:
@@ -942,11 +981,13 @@ def trade_tracker_loop():
                             send_arabic_voice_alert(f"مبروك، وصل سعر {arabic_name} إلى الهدف الأول السريع وتم تأمين الصفقة.", f"✅ *تحقق الهدف الأول السريع (1R: {t['tp1']}) وتأمين الستوب دخول لـ {t['asset']}!*")
                         elif low_p <= t["sl"]:
                             broadcast_msg(f"🛑 *تم ضرب وقف الخسارة الضيق لـ {t['asset']}.*")
-                            with trades_lock: active_trades.pop(k, None)
+                            with trades_lock:
+                                active_trades.pop(k, None)
                     else:
                         if low_p <= t["tp2"]:
                             send_arabic_voice_alert(f"مبروك، حقق سعر {arabic_name} الهدف الثاني السريع بالكامل.", f"🚀 *مبروك! تحقق الهدف الثاني السريع (2R: {t['tp2']}) للأصل {t['asset']}!*")
-                            with trades_lock: active_trades.pop(k, None)
+                            with trades_lock:
+                                active_trades.pop(k, None)
                         elif (not t["tp1_hit"]) and low_p <= t["tp1"]:
                             with trades_lock:
                                 if k in active_trades:
@@ -955,7 +996,8 @@ def trade_tracker_loop():
                             send_arabic_voice_alert(f"مبروك، وصل سعر {arabic_name} إلى الهدف الأول السريع وتم تأمين الصفقة.", f"✅ *تحقق الهدف الأول السريع (1R: {t['tp1']}) وتأمين الستوب دخول لـ {t['asset']}!*")
                         elif high_p >= t["sl"]:
                             broadcast_msg(f"🛑 *تم ضرب وقف الخسارة الضيق لـ {t['asset']}.*")
-                            with trades_lock: active_trades.pop(k, None)
+                            with trades_lock:
+                                active_trades.pop(k, None)
         except Exception as e:
             print(f"Tracker error: {e}")
         time.sleep(TRACKER_INTERVAL)
@@ -1001,6 +1043,7 @@ def approve_user_action(uid):
             "username": info.get("username", ""),
             "joined": time.strftime("%Y-%m-%d %H:%M", time.gmtime())
         }
+        save_users_to_disk()
     send_msg("🎉 *تمت موافقة المشرف على طلبك بنجاح!*\nيمكنك الآن استخدام جميع استراتيجيات البوت الخمس من الأزرار بالأسفل:", uid)
     send_msg(f"✅ *تم تفعيل المستخدم:* `{info.get('name')}` (`{uid}`) بنجاح.", ADMIN_CHAT_ID)
 
@@ -1009,12 +1052,14 @@ def reject_or_delete_user_action(uid):
     with users_lock:
         info = users_db["approved"].pop(uid, None) or users_db["pending"].pop(uid, {"name": "مستخدم"})
         users_db["banned"].add(uid)
+        save_users_to_disk()
     send_msg("🚫 *عذراً، تم إيقاف صلاحية وصولك للبوت من قِبل الإدارة.*", uid, remove_keyboard=True)
     send_msg(f"🗑️ *تم حذف وحظر المستخدم:* `{info.get('name', uid)}` (`{uid}`).", ADMIN_CHAT_ID)
 
 def format_active_trades_report():
     with trades_lock:
-        if not active_trades: return "📂 *لا توجد صفقات نشطة حالياً.*"
+        if not active_trades:
+            return "📂 *لا توجد صفقات نشطة حالياً.*"
         snap = dict(active_trades)
     lines = ["📂 *المناطق المراقبة تلقائياً (أهداف سريعة 1R / 2R):*\n━━━━━━━━━━━━━━━━━━"]
     for k, t in snap.items():
@@ -1025,8 +1070,10 @@ def format_active_trades_report():
 def telegram_listener():
     global ADMIN_CHAT_ID
     if TELEGRAM_BOT_TOKEN:
-        try: requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook", timeout=10)
-        except Exception: pass
+        try:
+            requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook", timeout=10)
+        except Exception:
+            pass
 
     offset = None
     while True:
@@ -1054,6 +1101,7 @@ def telegram_listener():
                                 elif action == "TOGGLE_GLOBAL":
                                     with users_lock:
                                         users_db["global_enabled"] = not users_db["global_enabled"]
+                                        save_users_to_disk()
                                         st_now = "🟢 تم تشغيل البوت لجميع المشتركين" if users_db["global_enabled"] else "🔴 تم إيقاف البوت عن جميع المشتركين"
                                     send_msg(f"⚙️ *{st_now}*", cb_chat)
                                     send_admin_panel(cb_chat)
@@ -1061,9 +1109,11 @@ def telegram_listener():
                                     with users_lock:
                                         users_db["banned"].clear()
                                         users_db["notified_visitors"].clear()
+                                        save_users_to_disk()
                                     send_msg("🔓 *تم فك الحظر عن جميع الحسابات المحظورة سابقاً.*", cb_chat)
                                 elif action == "LIST_APPROVED":
-                                    with users_lock: app_copy = dict(users_db["approved"])
+                                    with users_lock:
+                                        app_copy = dict(users_db["approved"])
                                     if not app_copy:
                                         send_msg("👥 *لا يوجد مستخدمون مفعلون حالياً.*", cb_chat)
                                     else:
@@ -1071,7 +1121,8 @@ def telegram_listener():
                                             kb = {"inline_keyboard": [[{"text": f"❌ حذف وحظر {u_info['name']}", "callback_data": f"ADM|DEL|{u_id}"}]]}
                                             send_msg(f"👤 *المستخدم:* `{u_info['name']}` (`@{u_info['username']}`)\n🆔 المعرف: `{u_id}`", cb_chat, kb)
                                 elif action == "LIST_PENDING":
-                                    with users_lock: pend_copy = dict(users_db["pending"])
+                                    with users_lock:
+                                        pend_copy = dict(users_db["pending"])
                                     if not pend_copy:
                                         send_msg("⏳ *لا توجد طلبات معلقة حالياً.*", cb_chat)
                                     else:
@@ -1109,13 +1160,17 @@ def telegram_listener():
                             elif text.startswith("/setpass "):
                                 new_p = text.replace("/setpass ", "").strip()
                                 if new_p:
-                                    with users_lock: users_db["password"] = new_p
+                                    with users_lock:
+                                        users_db["password"] = new_p
+                                        save_users_to_disk()
                                     send_msg(f"🔑 *تم تغيير كلمة سر البوت بنجاح إلى:* `{new_p}`", chat_id)
                                 continue
                             elif text.startswith("/setemail "):
                                 new_em = text.replace("/setemail ", "").strip()
                                 if "@" in new_em:
-                                    with users_lock: users_db["admin_email"] = new_em
+                                    with users_lock:
+                                        users_db["admin_email"] = new_em
+                                        save_users_to_disk()
                                     send_msg(f"📧 *تم حفظ إيميل التأكيد بنجاح:* `{new_em}`", chat_id)
                                 continue
 
@@ -1124,7 +1179,6 @@ def telegram_listener():
                                 is_banned = chat_id in users_db["banned"]
                                 is_global_on = users_db["global_enabled"]
                                 is_approved = chat_id in users_db["approved"]
-                                is_pending = chat_id in users_db["pending"]
                                 correct_pass = users_db["password"]
 
                             if is_banned:
@@ -1141,8 +1195,9 @@ def telegram_listener():
                                             "username": username,
                                             "time": time.strftime("%Y-%m-%d %H:%M", time.gmtime())
                                         }
+                                        save_users_to_disk()
                                     send_msg("✅ *كلمة السر صحيحة!* تم إرسال طلب تفعيل حسابك إلى المشرف للموافقة النهائية.", chat_id, remove_keyboard=True)
-                                    em_ok, em_info = send_approval_email(chat_id, full_name, username)
+                                    send_approval_email(chat_id, full_name, username)
                                     admin_kb = {
                                         "inline_keyboard": [[
                                             {"text": "✅ موافقة وتفعيل الحساب", "callback_data": f"ADM|APPROVE|{chat_id}"},
@@ -1163,6 +1218,7 @@ def telegram_listener():
                                         }
                                         first_visit = chat_id not in users_db["notified_visitors"]
                                         users_db["notified_visitors"].add(chat_id)
+                                        save_users_to_disk()
 
                                     if first_visit:
                                         admin_kb = {
@@ -1203,7 +1259,8 @@ def telegram_listener():
                         elif text in ["/trades", "📂 الأوامر المعلقة والنشطة"]:
                             send_msg(format_active_trades_report(), chat_id)
                         elif text in ["/clear", "🗑️ مسح الصفقات"] and is_admin(chat_id):
-                            with trades_lock: active_trades.clear()
+                            with trades_lock:
+                                active_trades.clear()
                             send_msg("🗑️ تم مسح الصفقات.", chat_id)
         except Exception as e:
             print(f"Listener error: {e}")
@@ -1234,8 +1291,10 @@ def admin_email_action():
 def keep_alive_pinger():
     while True:
         time.sleep(480)
-        try: requests.get(f"{RENDER_EXTERNAL_URL}/health", timeout=10)
-        except Exception: pass
+        try:
+            requests.get(f"{RENDER_EXTERNAL_URL}/health", timeout=10)
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     threading.Thread(target=telegram_listener, daemon=True).start()

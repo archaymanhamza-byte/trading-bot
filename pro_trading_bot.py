@@ -38,6 +38,7 @@ trades_lock = threading.Lock()
 users_db = {
     "approved": {},
     "pending": {},
+    "notified_visitors": set(),  # لمنع تكرار إشعار الزائر قبل كتابة كلمة السر
     "banned": set(),
     "global_enabled": True,
     "password": BOT_PASSWORD,
@@ -126,7 +127,7 @@ def send_approval_email(user_id, full_name, username):
     html_body = f"""
     <div dir="rtl" style="font-family: Arial, sans-serif; padding: 20px; background: #f4f6f9; border-radius: 10px;">
         <h2>🚨 طلب دخول جديد إلى بوت الذهب والبيتكوين</h2>
-        <p>أدخل المستخدم التالي كلمة السر الصحيحة وينتظر موافقتك:</p>
+        <p>يطلب المستخدم التالي الدخول إلى البوت وينتظر موافقتك:</p>
         <ul>
             <li><b>الاسم:</b> {full_name}</li>
             <li><b>المعرف:</b> @{username}</li>
@@ -164,6 +165,7 @@ def get_inline_tf_buttons(sym_type):
         ]
     }
 
+# ==================== دالة الإرسال المحمية ضد أخطاء الرموز الخاصة ====================
 def send_msg(text, chat_id=None, inline_markup=None, remove_keyboard=False):
     target = str(chat_id or ADMIN_CHAT_ID).strip()
     if not TELEGRAM_BOT_TOKEN or not target:
@@ -176,7 +178,19 @@ def send_msg(text, chat_id=None, inline_markup=None, remove_keyboard=False):
     else:
         markup = ADMIN_KEYBOARD if is_admin(target) else USER_KEYBOARD
     try:
-        requests.post(url, json={"chat_id": target, "text": text, "parse_mode": "Markdown", "reply_markup": markup}, timeout=12)
+        res = requests.post(
+            url,
+            json={"chat_id": target, "text": text, "parse_mode": "Markdown", "reply_markup": markup},
+            timeout=12
+        )
+        # إذا فشل الإرسال بسبب وجود رموز مثل (_) في اسم المستخدم، يعيد البوت إرسالها فوراً بدون Markdown
+        if not res.ok:
+            clean_text = text.replace("*", "").replace("`", "")
+            requests.post(
+                url,
+                json={"chat_id": target, "text": clean_text, "reply_markup": markup},
+                timeout=12
+            )
     except Exception as e:
         print(f"Telegram text error: {e}")
 
@@ -241,12 +255,14 @@ def send_photo_msg(photo_buf, caption, sym_type="GOLD", chat_id=None):
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     try:
-        requests.post(
+        res = requests.post(
             url,
             data={"chat_id": target, "caption": caption, "parse_mode": "Markdown", "reply_markup": json.dumps(inline_kb)},
             files={"photo": ("chart.png", photo_buf, "image/png")},
             timeout=25
         )
+        if not res.ok:
+            send_msg(caption, target, inline_kb)
     except Exception:
         send_msg(caption, target, inline_kb)
 
@@ -612,7 +628,6 @@ def detect_bos_choch(plot_df):
     return events
 
 def analyze_structure_and_ote(df, is_long_bias=True):
-    """استخراج منطقة دخول قناصة وضيقة حول مستوى 70.5% لتقليص وقف الخسارة"""
     recent = df.tail(55).reset_index(drop=True)
     curr_price = float(recent["close"].iloc[-1])
     atr = max(float(recent["ATR"].iloc[-1]), curr_price * 0.001)
@@ -635,7 +650,6 @@ def analyze_structure_and_ote(df, is_long_bias=True):
     demand_bottom, demand_top = max(swing_low, bull_ote_786 - (0.2 * atr)), max(swing_low + (0.5 * atr), bull_ote_618)
     supply_bottom, supply_top = min(swing_high - (0.5 * atr), bear_ote_618), min(swing_high, bear_ote_786 + (0.2 * atr))
 
-    # تضييق منطقة الدخول (Sniper Zone) لتكون بسمك صغير (0.30 * ATR) حول نقطة 0.705
     half_band = 0.15 * atr
     if is_long_bias:
         ote_zone = (bull_ote_786, bull_ote_618)
@@ -809,7 +823,6 @@ def analyze_and_send_zones(sym_type, ltf_str=None, chat_id=None, silent_register
     curr_price = round(float(l_curr["close"]), 2)
     atr = max(float(l_curr["ATR"]), curr_price * 0.001)
 
-    # المعادلات الجديدة: وقف خسارة ضيق (0.20 * ATR خلف المنطقة) وأهداف سريعة (1R و 2R)
     if is_long:
         dir_label = "شراء معلق سريع (BUY LIMIT — 1R/2R) 🟢"
         entry_mid = round((entry_zone[0] + entry_zone[1]) / 2, 2)
@@ -934,7 +947,7 @@ def trade_tracker_loop():
             print(f"Tracker error: {e}")
         time.sleep(TRACKER_INTERVAL)
 
-# ==================== 8. لوحة تحكم المشرف والاستماع للأوامر ====================
+# ==================== 8. لوحة تحكم المشرف وإدارة المستخدمين المضمونة ====================
 def send_admin_panel(chat_id):
     with users_lock:
         app_count = len(users_db["approved"])
@@ -997,6 +1010,7 @@ def format_active_trades_report():
     return "\n".join(lines)
 
 def telegram_listener():
+    global ADMIN_CHAT_ID
     if TELEGRAM_BOT_TOKEN:
         try: requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook", timeout=10)
         except Exception: pass
@@ -1031,7 +1045,9 @@ def telegram_listener():
                                     send_msg(f"⚙️ *{st_now}*", cb_chat)
                                     send_admin_panel(cb_chat)
                                 elif action == "CLEAR_BANNED":
-                                    with users_lock: users_db["banned"].clear()
+                                    with users_lock:
+                                        users_db["banned"].clear()
+                                        users_db["notified_visitors"].clear()
                                     send_msg("🔓 *تم فك الحظر عن جميع الحسابات المحظورة سابقاً.*", cb_chat)
                                 elif action == "LIST_APPROVED":
                                     with users_lock: app_copy = dict(users_db["approved"])
@@ -1040,7 +1056,7 @@ def telegram_listener():
                                     else:
                                         for u_id, u_info in app_copy.items():
                                             kb = {"inline_keyboard": [[{"text": f"❌ حذف وحظر {u_info['name']}", "callback_data": f"ADM|DEL|{u_id}"}]]}
-                                            send_msg(f"👤 *المستخدم:* `{u_info['name']}` (@{u_info['username']})\n🆔 المعرف: `{u_id}`", cb_chat, kb)
+                                            send_msg(f"👤 *المستخدم:* `{u_info['name']}` (`@{u_info['username']}`)\n🆔 المعرف: `{u_id}`", cb_chat, kb)
                                 elif action == "LIST_PENDING":
                                     with users_lock: pend_copy = dict(users_db["pending"])
                                     if not pend_copy:
@@ -1051,7 +1067,7 @@ def telegram_listener():
                                                 {"text": "✅ موافقة وتفعيل", "callback_data": f"ADM|APPROVE|{u_id}"},
                                                 {"text": "🚫 رفض وحظر", "callback_data": f"ADM|DEL|{u_id}"}
                                             ]]}
-                                            send_msg(f"⏳ *طلب تفعيل معلق:*\nالاسم: `{u_info['name']}` (@{u_info['username']})\nID: `{u_id}`", cb_chat, kb)
+                                            send_msg(f"⏳ *طلب تفعيل معلق:*\nالاسم: `{u_info['name']}` (`@{u_info['username']}`)\nID: `{u_id}`", cb_chat, kb)
                                 continue
 
                             if cb_data.startswith("TF|"):
@@ -1073,6 +1089,7 @@ def telegram_listener():
                         full_name = f"{chat_obj.get('first_name', '')} {chat_obj.get('last_name', '')}".strip() or "مستخدم"
                         username = chat_obj.get("username", "بدون_معرف")
 
+                        # --- أوامر المشرف الخاصة ---
                         if is_admin(chat_id):
                             if text in ["🔐 لوحة تحكم المشرف", "/admin"]:
                                 send_admin_panel(chat_id)
@@ -1089,7 +1106,13 @@ def telegram_listener():
                                     with users_lock: users_db["admin_email"] = new_em
                                     send_msg(f"📧 *تم حفظ إيميل التأكيد بنجاح:* `{new_em}`", chat_id)
                                 continue
+                            elif text.startswith("/approve "):
+                                target_uid = text.replace("/approve ", "").strip()
+                                if target_uid:
+                                    approve_user_action(target_uid)
+                                continue
 
+                        # --- فحص ومعالجة أي مستخدم جديد غير المشرف ---
                         if not is_admin(chat_id):
                             with users_lock:
                                 is_banned = chat_id in users_db["banned"]
@@ -1105,10 +1128,8 @@ def telegram_listener():
                                 send_msg("⏸️ *البوت متوقف مؤقتاً للصيانة بأمر من الإدارة.*", chat_id, remove_keyboard=True)
                                 continue
                             if not is_approved:
-                                if is_pending:
-                                    send_msg("⏳ *طلبك قيد المراجعة لدى المشرف.*", chat_id, remove_keyboard=True)
-                                    continue
-                                if text == correct_pass:
+                                # مقارنة كلمة السر بدون حساسية للأحرف الكبيرة/الصغيرة
+                                if text.lower() == correct_pass.lower():
                                     with users_lock:
                                         users_db["pending"][chat_id] = {
                                             "name": full_name,
@@ -1124,12 +1145,46 @@ def telegram_listener():
                                         ]]
                                     }
                                     send_msg(
-                                        f"🚨 *طلب دخول جديد للبوت:*\n👤 *الاسم:* `{full_name}` (@{username})\n🆔 *المعرف:* `{chat_id}`\n📧 *الإيميل:* `{em_info}`",
+                                        f"🚨 *طلب دخول مؤكد (أدخل كلمة السر الصحيحة):*\n"
+                                        f"👤 *الاسم:* `{full_name}` (`@{username}`)\n"
+                                        f"🆔 *المعرف:* `{chat_id}`\n"
+                                        f"📧 *الإيميل:* `{em_info}`\n\n"
+                                        f"👇 *اضغط للموافقة أو الرفض الفوري:*",
                                         ADMIN_CHAT_ID,
                                         admin_kb
                                     )
                                 else:
-                                    send_msg("🔒 *هذا البوت خاص ومحمي بكلمة سر.*\n🔑 يرجى إرسال **كلمة السر الصحيحة** أولاً:", chat_id, remove_keyboard=True)
+                                    # حتى لو لم يكتب كلمة السر بعد (مثل ضغط /start)، نسجله في قائمة الانتظار ونرسل إشعاراً للمشرف!
+                                    with users_lock:
+                                        users_db["pending"][chat_id] = {
+                                            "name": full_name,
+                                            "username": username,
+                                            "time": time.strftime("%Y-%m-%d %H:%M", time.gmtime())
+                                        }
+                                        first_visit = chat_id not in users_db["notified_visitors"]
+                                        users_db["notified_visitors"].add(chat_id)
+
+                                    if first_visit:
+                                        admin_kb = {
+                                            "inline_keyboard": [[
+                                                {"text": "✅ تفعيل فوري (تجاوز كلمة السر)", "callback_data": f"ADM|APPROVE|{chat_id}"},
+                                                {"text": "🚫 رفض وحظر", "callback_data": f"ADM|DEL|{chat_id}"}
+                                            ]]
+                                        }
+                                        send_msg(
+                                            f"👀 *شخص جديد فتح البوت الآن ويحاول الدخول:*\n"
+                                            f"👤 *الاسم:* `{full_name}` (`@{username}`)\n"
+                                            f"🆔 *المعرف:* `{chat_id}`\n"
+                                            f"💬 *الرسالة التي أرسلها:* `{text}`\n\n"
+                                            f"👇 *يمكنك تفعيله فوراً من الزر أدناه أو انتظاره حتى يكتب كلمة السر:*",
+                                            ADMIN_CHAT_ID,
+                                            admin_kb
+                                        )
+
+                                    if is_pending and text not in ["/start", "/help"]:
+                                        send_msg("🔑 *كلمة السر غير صحيحة، أو أن طلبك قيد المراجعة لدى المشرف.*\nيرجى إرسال كلمة السر الصحيحة أو انتظار موافقة الإدارة:", chat_id, remove_keyboard=True)
+                                    else:
+                                        send_msg("🔒 *هذا البوت خاص ومحمي بكلمة سر.*\n🔑 يرجى إرسال **كلمة السر الصحيحة** (أو انتظار تفعيل المشرف لحسابك):", chat_id, remove_keyboard=True)
                                 continue
 
                         if text in ["/start", "/help"]:
@@ -1164,7 +1219,7 @@ def telegram_listener():
 
 @app.route("/")
 def home():
-    return "Fast 1R/2R + Tight SL Institutional Bot is Live 24/7!"
+    return "Fast 1R/2R + Bulletproof Admin Approval Bot is Live 24/7!"
 
 @app.route("/health")
 def health():
@@ -1196,9 +1251,9 @@ if __name__ == "__main__":
     threading.Thread(target=trade_tracker_loop, daemon=True).start()
     threading.Thread(target=keep_alive_pinger, daemon=True).start()
     send_msg(
-        "⚡ *تم تعديل المعادلات إلى نظام الوقف الضيق والأهداف السريعة (`1R` و `2R`) بنجاح!*\n"
-        "• وقف الخسارة أصبح يوضع مباشرة خلف منطقة الدخول القناصة (`70.5%`).\n"
-        "• الهدف الأول (`TP1`) أصبح على بُعد `1R` لتأمين الصفقة بسرعة، والهدف الثاني (`TP2`) عند `2R`."
+        "🔔 *تم تحديث نظام إشعارات الموافقة المضمون 100%!*\n"
+        "• سيصلك الآن إشعار فوري بمجرد أن يفتح أي شخص البوت (حتى قبل كتابة كلمة السر) مع زر **`✅ تفعيل فوري`**.\n"
+        "• اطلب من الشخص الآن أن يرسل أي رسالة للبوت (أو `/start`) ليصلك إشعاره في نفس الثانية."
     )
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)

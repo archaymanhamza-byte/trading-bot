@@ -1,3 +1,7 @@
+# Hardened derivative of the user-provided bot.
+# Important: price levels are informational estimates; this bot does not execute trades.
+# Persistent user records, per-user settings, and monitored trades are stored in SQLite.
+# Email approval tokens are random, hashed at rest, expire, and are consumed once on POST.
 import os
 import io
 import json
@@ -7,6 +11,11 @@ import wave
 import struct
 import math
 import hashlib
+import html
+import secrets
+import tempfile
+import sqlite3
+from contextlib import contextmanager
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -19,13 +28,14 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from flask import Flask, request
+from werkzeug.security import generate_password_hash, check_password_hash
 
 # ==================== 1. الإعدادات الأساسية وإعدادات الحماية ====================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 ADMIN_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "https://trading-bot-1-88ha.onrender.com").strip()
 
-BOT_PASSWORD = os.getenv("BOT_PASSWORD", "Gold2026").strip()
+BOT_PASSWORD = os.getenv("BOT_PASSWORD", "").strip()
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "").strip()
 SMTP_USER = os.getenv("SMTP_USER", "").strip()
 SMTP_APP_PASS = os.getenv("SMTP_APP_PASS", "").strip()
@@ -35,54 +45,132 @@ AUTO_SCAN_INTERVAL = 900
 active_trades = {}
 trades_lock = threading.Lock()
 
-# ==================== نظام الحفظ الدائم (Persistent Storage) ====================
-USERS_FILE = "users_store.json"
+# ==================== SQLite persistence ====================
+DB_PATH = os.path.abspath(os.getenv("BOT_DB_PATH", "trading_bot.sqlite3"))
 users_lock = threading.RLock()
+trades_lock = threading.RLock()
+settings_context = threading.local()
+
+@contextmanager
+def db_connect():
+    conn = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+def init_db():
+    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+    with db_connect() as conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS app_state (
+                key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS settings (
+                user_id TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS active_trades (
+                trade_key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS admin_tokens (
+                token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL,
+                action TEXT NOT NULL CHECK(action IN ('approve','reject')),
+                expires_at INTEGER NOT NULL, used_at INTEGER, created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_admin_tokens_expiry ON admin_tokens(expires_at);
+        """)
+
+init_db()
 
 def load_users_from_disk():
-    default_db = {
-        "approved": {},
-        "pending": {},
-        "notified_visitors": set(),
-        "banned": set(),
-        "global_enabled": True,
-        "password": BOT_PASSWORD,
-        "admin_email": ADMIN_EMAIL
-    }
-    if os.path.exists(USERS_FILE):
-        try:
-            with open(USERS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                data["approved"] = data.get("approved", {})
-                data["pending"] = data.get("pending", {})
-                data["banned"] = set(data.get("banned", []))
-                data["notified_visitors"] = set(data.get("notified_visitors", []))
-                data["global_enabled"] = data.get("global_enabled", True)
-                data["password"] = data.get("password", BOT_PASSWORD)
-                data["admin_email"] = data.get("admin_email", ADMIN_EMAIL)
-                return data
-        except Exception as e:
-            print(f"Error loading users store: {e}")
-    return default_db
+    default = {"approved": {}, "pending": {}, "notified_visitors": set(),
+               "banned": set(), "global_enabled": True,
+               "password": generate_password_hash(BOT_PASSWORD) if BOT_PASSWORD else "", "admin_email": ADMIN_EMAIL}
+    with db_connect() as conn:
+        row = conn.execute("SELECT value FROM app_state WHERE key='users'").fetchone()
+    if not row:
+        # One-time migration from the prior JSON store, if present.
+        old_path = os.getenv("USERS_FILE", "users_store.json")
+        if os.path.exists(old_path):
+            try:
+                with open(old_path, encoding="utf-8") as f:
+                    old = json.load(f)
+                default.update(old)
+                stored_password=str(default.get("password", ""))
+                if stored_password and not stored_password.startswith(("pbkdf2:", "scrypt:")):
+                    default["password"] = generate_password_hash(stored_password)
+                default["banned"] = set(default.get("banned", []))
+                default["notified_visitors"] = set(default.get("notified_visitors", []))
+                save_users_to_disk(default)
+            except Exception as e:
+                print(f"Legacy users migration error: {e}")
+        return default
+    try:
+        data=json.loads(row["value"])
+        default.update(data)
+        stored_password=str(default.get("password", ""))
+        if stored_password and not stored_password.startswith(("pbkdf2:", "scrypt:")):
+            default["password"] = generate_password_hash(stored_password)
+            save_users_to_disk(default)
+        default["banned"] = set(default.get("banned", []))
+        default["notified_visitors"] = set(default.get("notified_visitors", []))
+        return default
+    except Exception as e:
+        print(f"SQLite users state error: {e}")
+        return default
 
-def save_users_to_disk():
+def save_users_to_disk(data=None):
     with users_lock:
-        try:
-            data = {
-                "approved": users_db["approved"],
-                "pending": users_db["pending"],
-                "notified_visitors": list(users_db["notified_visitors"]),
-                "banned": list(users_db["banned"]),
-                "global_enabled": users_db["global_enabled"],
-                "password": users_db["password"],
-                "admin_email": users_db["admin_email"]
-            }
-            with open(USERS_FILE, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=4)
-        except Exception as e:
-            print(f"Error saving users store: {e}")
+        value = data if data is not None else users_db
+        payload = {"approved": value["approved"], "pending": value["pending"],
+                   "notified_visitors": list(value["notified_visitors"]),
+                   "banned": list(value["banned"]), "global_enabled": value["global_enabled"],
+                   "password": value["password"], "admin_email": value["admin_email"]}
+        with db_connect() as conn:
+            conn.execute("INSERT INTO app_state(key,value,updated_at) VALUES('users',?,?) "
+                         "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                         (json.dumps(payload, ensure_ascii=False), int(time.time())))
 
 users_db = load_users_from_disk()
+
+def verify_bot_password(candidate, stored):
+    stored=str(stored or "")
+    if stored.startswith(("pbkdf2:", "scrypt:")):
+        try: return check_password_hash(stored, str(candidate))
+        except ValueError: return False
+    # One-time migration of a legacy/default plaintext value after successful authentication.
+    if stored and secrets.compare_digest(str(candidate).encode("utf-8"), stored.encode("utf-8")):
+        with users_lock:
+            users_db["password"] = generate_password_hash(str(candidate))
+            save_users_to_disk()
+        return True
+    return False
+
+def load_trades_from_db():
+    with db_connect() as conn:
+        rows=conn.execute("SELECT trade_key,value FROM active_trades").fetchall()
+    result={}
+    for row in rows:
+        try: result[row["trade_key"]]=json.loads(row["value"])
+        except Exception as e: print(f"Ignoring invalid saved trade {row['trade_key']}: {e}")
+    return result
+
+active_trades = load_trades_from_db()
+
+def persist_active_trades():
+    # Replace the snapshot in one transaction so stale rows cannot survive a deletion.
+    with trades_lock:
+        snapshot={k: dict(v) for k,v in active_trades.items()}
+    with db_connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("DELETE FROM active_trades")
+        conn.executemany("INSERT INTO active_trades(trade_key,value,updated_at) VALUES(?,?,?)",
+                         [(k,json.dumps(v,ensure_ascii=False),int(time.time())) for k,v in snapshot.items()])
+        conn.commit()
 
 # ==================== إعدادات الفريمات ونظام الأرباح بالدولار (TP1 / TP2 / TP3) ====================
 PROFIT_PROFILES = {
@@ -102,17 +190,42 @@ PROFIT_PROFILES = {
     }
 }
 
-user_settings = {
-    "mode_name": "مضاربة متوسطة (15m / 4h)",
-    "ltf": "15m",
-    "htf": "4h",
-    "profit_style": "scalp",
-    "lot_size": 0.01,       # حجم اللوت الافتراضي لحساب مسافة الدولارات
-    "tp1_usd": 5.0,         # الهدف الأول بالدولار
-    "tp2_usd": 10.0,        # الهدف الثاني بالدولار
-    "tp3_usd": 20.0,        # الهدف الثالث بالدولار
-    "sl_usd": 5.0           # وقف الخسارة بالدولار
+DEFAULT_USER_SETTINGS = {
+    "mode_name": "مضاربة متوسطة (15m / 4h)", "ltf": "15m", "htf": "4h",
+    "profit_style": "scalp", "lot_size": 0.01,
+    "tp1_usd": 5.0, "tp2_usd": 10.0, "tp3_usd": 20.0, "sl_usd": 5.0
 }
+
+def current_settings_user():
+    return str(getattr(settings_context, "user_id", "default"))
+
+def bind_settings_user(user_id):
+    settings_context.user_id = str(user_id or "default")
+
+class UserSettings:
+    def _read(self):
+        uid=current_settings_user()
+        with db_connect() as conn:
+            row=conn.execute("SELECT value FROM settings WHERE user_id=?",(uid,)).fetchone()
+        data=dict(DEFAULT_USER_SETTINGS)
+        if row:
+            try: data.update(json.loads(row["value"]))
+            except Exception as e: print(f"Invalid settings for {uid}: {e}")
+        return uid,data
+    def _write(self, uid, data):
+        with db_connect() as conn:
+            conn.execute("INSERT INTO settings(user_id,value,updated_at) VALUES(?,?,?) "
+                         "ON CONFLICT(user_id) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                         (uid,json.dumps(data,ensure_ascii=False),int(time.time())))
+    def __getitem__(self,key): return self._read()[1][key]
+    def __setitem__(self,key,value):
+        uid,data=self._read(); data[key]=value; self._write(uid,data)
+    def __iter__(self): return iter(self._read()[1])
+    def __len__(self): return len(self._read()[1])
+    def update(self,*args,**kwargs):
+        uid,data=self._read(); data.update(*args,**kwargs); self._write(uid,data)
+
+user_settings = UserSettings()
 
 TIMEFRAME_MODES = {
     "scalp": {"name": "سكالبينج سريع (5m / 15m) ⚡", "ltf": "5m", "htf": "15m"},
@@ -185,29 +298,67 @@ def get_all_recipient_ids():
                     recipients.append(uid)
     return recipients
 
-def get_action_token(chat_id, action):
-    secret = f"{TELEGRAM_BOT_TOKEN}_{chat_id}_{action}"
-    return hashlib.sha256(secret.encode()).hexdigest()[:16]
+ADMIN_TOKEN_TTL = 30 * 60
+
+def issue_admin_token(user_id, action):
+    if action not in ("approve", "reject"):
+        raise ValueError("Unsupported admin action")
+    raw=secrets.token_urlsafe(32)
+    digest=hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    now=int(time.time())
+    with db_connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("DELETE FROM admin_tokens WHERE expires_at < ? OR used_at IS NOT NULL",(now,))
+        conn.execute("UPDATE admin_tokens SET used_at=? WHERE user_id=? AND action=? AND used_at IS NULL",
+                     (now,str(user_id),action))
+        conn.execute("INSERT INTO admin_tokens(token_hash,user_id,action,expires_at,created_at) VALUES(?,?,?,?,?)",
+                     (digest,str(user_id),action,now+ADMIN_TOKEN_TTL,now))
+        conn.commit()
+    return raw
+
+def admin_token_is_valid(user_id, action, raw):
+    digest=hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    with db_connect() as conn:
+        row=conn.execute("SELECT 1 FROM admin_tokens WHERE token_hash=? AND user_id=? AND action=? AND used_at IS NULL AND expires_at>?",
+                         (digest,str(user_id),action,int(time.time()))).fetchone()
+    return row is not None
+
+def consume_admin_token(user_id, action, raw):
+    digest=hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    now=int(time.time())
+    with db_connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        cur=conn.execute("UPDATE admin_tokens SET used_at=? WHERE token_hash=? AND user_id=? AND action=? AND used_at IS NULL AND expires_at>?",
+                         (now,digest,str(user_id),action,now))
+        if cur.rowcount == 1:
+            # A decision invalidates the other action link for the same pending request.
+            conn.execute("UPDATE admin_tokens SET used_at=? WHERE user_id=? AND used_at IS NULL",
+                         (now,str(user_id)))
+        conn.commit()
+        return cur.rowcount == 1
 
 def send_approval_email(user_id, full_name, username):
     target_email = users_db["admin_email"] or ADMIN_EMAIL
     if not target_email or not SMTP_USER or not SMTP_APP_PASS:
         return False, "التأكيد مفعل عبر تيليجرام مباشرة"
 
-    approve_tok = get_action_token(user_id, "approve")
-    reject_tok = get_action_token(user_id, "reject")
+    approve_tok = issue_admin_token(user_id, "approve")
+    reject_tok = issue_admin_token(user_id, "reject")
     approve_url = f"{RENDER_EXTERNAL_URL}/admin/action?uid={user_id}&act=approve&token={approve_tok}"
     reject_url = f"{RENDER_EXTERNAL_URL}/admin/action?uid={user_id}&act=reject&token={reject_tok}"
 
-    subject = f"🔐 طلب تفعيل مستخدم جديد في بوت التداول: {full_name}"
+    safe_name = html.escape(str(full_name))
+    safe_username = html.escape(str(username))
+    safe_user_id = html.escape(str(user_id))
+    subject = f"طلب تفعيل مستخدم جديد في بوت التداول: {full_name}"
     html_body = f"""
     <div dir="rtl" style="font-family: Arial, sans-serif; padding: 20px; background: #f4f6f9; border-radius: 10px;">
         <h2>🚨 طلب دخول جديد إلى بوت الذهب والبيتكوين</h2>
         <p>يطلب المستخدم التالي الدخول إلى البوت وينتظر موافقتك:</p>
         <ul>
-            <li><b>الاسم:</b> {full_name}</li>
-            <li><b>المعرف:</b> @{username}</li>
-            <li><b>Chat ID:</b> <code>{user_id}</code></li>
+            <li><b>الاسم:</b> {safe_name}</li>
+            <li><b>المعرف:</b> @{safe_username}</li>
+            <li><b>Chat ID:</b> <code>{safe_user_id}</code></li>
         </ul>
         <p style="margin-top: 25px;">
             <a href="{approve_url}" style="background: #00c853; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; margin-left: 10px;">✅ موافقة وتفعيل</a>
@@ -244,6 +395,14 @@ def get_inline_tf_buttons(sym_type):
             ]
         ]
     }
+
+
+def escape_markdown(text):
+    """Escape untrusted text before embedding it in Telegram Markdown messages."""
+    value = str(text)
+    for char in ("\\", "_", "*", "[", "`"):
+        value = value.replace(char, "\\" + char)
+    return value
 
 def send_msg(text, chat_id=None, inline_markup=None, remove_keyboard=False):
     target = str(chat_id or ADMIN_CHAT_ID).strip()
@@ -884,8 +1043,10 @@ def register_pending_trade(trade_key, asset_name, sym_type, is_long, entry_zone,
             "tp1_hit": False,
             "tp2_hit": False,
             "tf": tf_label,
-            "created_at": time.strftime("%H:%M UTC", time.gmtime())
+            "created_at": time.strftime("%H:%M UTC", time.gmtime()),
+            "user_id": current_settings_user()
         }
+        persist_active_trades()
 
 def analyze_and_send_zones(sym_type, ltf_str=None, chat_id=None, silent_register_only=False):
     ltf_use = ltf_str or user_settings["ltf"]
@@ -951,7 +1112,7 @@ def analyze_and_send_zones(sym_type, ltf_str=None, chat_id=None, silent_register
     exit_targets = (tp1, tp2, tp3)
     usd_targets = (u_tp1, u_tp2, u_tp3, u_sl)
 
-    register_pending_trade(f"{sym_type}_{ltf_use}", asset_name, sym_type, is_long, entry_zone, sl, exit_targets, usd_targets, ltf_use)
+    register_pending_trade(f"{current_settings_user()}_{sym_type}_{ltf_use}", asset_name, sym_type, is_long, entry_zone, sl, exit_targets, usd_targets, ltf_use)
     if silent_register_only:
         return
 
@@ -988,8 +1149,8 @@ def auto_zone_scanner_loop():
         try:
             analyze_and_send_zones("GOLD", user_settings["ltf"], silent_register_only=True)
             analyze_and_send_zones("BTC", user_settings["ltf"], silent_register_only=True)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Auto scanner error: {type(e).__name__}: {e}")
         time.sleep(AUTO_SCAN_INTERVAL)
 
 def get_latest_price_extremes(symbol_type):
@@ -998,6 +1159,17 @@ def get_latest_price_extremes(symbol_type):
         return None
     last = df.iloc[-1]
     return {"close": round(float(last["close"]), 2), "high": round(float(last["high"]), 2), "low": round(float(last["low"]), 2)}
+
+def notify_trade_voice(trade, spoken_text, caption):
+    owner = str(trade.get("user_id", "default"))
+    send_arabic_voice_alert(spoken_text, caption, None if owner == "default" else owner)
+
+def notify_trade_text(trade, text):
+    owner = str(trade.get("user_id", "default"))
+    if owner == "default":
+        broadcast_msg(text)
+    else:
+        send_msg(text, owner)
 
 def trade_tracker_loop():
     while True:
@@ -1026,32 +1198,36 @@ def trade_tracker_loop():
                             with trades_lock:
                                 if k in active_trades:
                                     active_trades[k]["voice_alert_sent"] = True
+                                    persist_active_trades()
                             speech_txt = f"تنبيه هام من بوت التداول. وصل سعر {arabic_name} الآن إلى منطقة الدخول الذهبية عند مستوى {int(curr_p)} لصفقة {dir_word}."
                             caption_txt = f"🗣️ *تنبيه صوتي ناطق: وصل سعر {arabic_name} إلى منطقة الدخول!*\n🎯 المنطقة: `{t['entry_low']} - {t['entry_high']}` | السعر: `{curr_p}`"
-                            send_arabic_voice_alert(speech_txt, caption_txt)
+                            notify_trade_voice(t, speech_txt, caption_txt)
 
                     if t["status"] == "PENDING":
                         if low_p <= t["entry_high"] and high_p >= t["entry_low"]:
                             with trades_lock:
                                 if k in active_trades:
                                     active_trades[k]["status"] = "ACTIVE"
+                                    persist_active_trades()
                         continue
 
                     if t["is_long"]:
                         if high_p >= t["tp3"]:
-                            send_arabic_voice_alert(
+                            notify_trade_voice(t, 
                                 f"مبروك، حقق سعر {arabic_name} الهدف الثالث بالكامل بربح {int(t['tp3_usd'])} دولار.",
                                 f"🚀 *مبروك! تحقق الهدف الثالث الكامل (TP3: {t['tp3']} | +${t['tp3_usd']}) للأصل {t['asset']}!*"
                             )
                             with trades_lock:
                                 active_trades.pop(k, None)
+                                persist_active_trades()
                         elif (not t.get("tp2_hit", False)) and high_p >= t["tp2"]:
                             with trades_lock:
                                 if k in active_trades:
                                     active_trades[k]["tp2_hit"] = True
                                     active_trades[k]["tp1_hit"] = True
                                     active_trades[k]["sl"] = t["tp1"]
-                            send_arabic_voice_alert(
+                                    persist_active_trades()
+                            notify_trade_voice(t, 
                                 f"مبروك، وصل سعر {arabic_name} إلى الهدف الثاني بربح {int(t['tp2_usd'])} دولار وتم رفع الوقف إلى الهدف الأول.",
                                 f"🔥 *تحقق الهدف الثاني (TP2: {t['tp2']} | +${t['tp2_usd']}) لـ {t['asset']} وتم حجز ربح الهدف الأول!*"
                             )
@@ -1060,29 +1236,33 @@ def trade_tracker_loop():
                                 if k in active_trades:
                                     active_trades[k]["tp1_hit"] = True
                                     active_trades[k]["sl"] = t["entry_mid"]
-                            send_arabic_voice_alert(
+                                    persist_active_trades()
+                            notify_trade_voice(t, 
                                 f"مبروك، وصل سعر {arabic_name} إلى الهدف الأول بربح {int(t['tp1_usd'])} دولار وتم تأمين الصفقة على الدخول.",
                                 f"✅ *تحقق الهدف الأول (TP1: {t['tp1']} | +${t['tp1_usd']}) وتأمين الستوب على الدخول لـ {t['asset']}!*"
                             )
                         elif low_p <= t["sl"]:
-                            broadcast_msg(f"🛑 *تم ضرب مستوى الوقف ({t['sl']}) لـ {t['asset']}.*")
+                            notify_trade_text(t, f"🛑 *تم ضرب مستوى الوقف ({t['sl']}) لـ {t['asset']}.*")
                             with trades_lock:
                                 active_trades.pop(k, None)
+                                persist_active_trades()
                     else:
                         if low_p <= t["tp3"]:
-                            send_arabic_voice_alert(
+                            notify_trade_voice(t, 
                                 f"مبروك، حقق سعر {arabic_name} الهدف الثالث بالكامل بربح {int(t['tp3_usd'])} دولار.",
                                 f"🚀 *مبروك! تحقق الهدف الثالث الكامل (TP3: {t['tp3']} | +${t['tp3_usd']}) للأصل {t['asset']}!*"
                             )
                             with trades_lock:
                                 active_trades.pop(k, None)
+                                persist_active_trades()
                         elif (not t.get("tp2_hit", False)) and low_p <= t["tp2"]:
                             with trades_lock:
                                 if k in active_trades:
                                     active_trades[k]["tp2_hit"] = True
                                     active_trades[k]["tp1_hit"] = True
                                     active_trades[k]["sl"] = t["tp1"]
-                            send_arabic_voice_alert(
+                                    persist_active_trades()
+                            notify_trade_voice(t, 
                                 f"مبروك، وصل سعر {arabic_name} إلى الهدف الثاني بربح {int(t['tp2_usd'])} دولار وتم رفع الوقف إلى الهدف الأول.",
                                 f"🔥 *تحقق الهدف الثاني (TP2: {t['tp2']} | +${t['tp2_usd']}) لـ {t['asset']} وتم حجز ربح الهدف الأول!*"
                             )
@@ -1091,14 +1271,17 @@ def trade_tracker_loop():
                                 if k in active_trades:
                                     active_trades[k]["tp1_hit"] = True
                                     active_trades[k]["sl"] = t["entry_mid"]
-                            send_arabic_voice_alert(
+                                    persist_active_trades()
+                            notify_trade_voice(t, 
                                 f"مبروك، وصل سعر {arabic_name} إلى الهدف الأول بربح {int(t['tp1_usd'])} دولار وتم تأمين الصفقة على الدخول.",
                                 f"✅ *تحقق الهدف الأول (TP1: {t['tp1']} | +${t['tp1_usd']}) وتأمين الستوب على الدخول لـ {t['asset']}!*"
                             )
                         elif high_p >= t["sl"]:
-                            broadcast_msg(f"🛑 *تم ضرب مستوى الوقف ({t['sl']}) لـ {t['asset']}.*")
+                            notify_trade_text(t, f"🛑 *تم ضرب مستوى الوقف ({t['sl']}) لـ {t['asset']}.*")
                             with trades_lock:
                                 active_trades.pop(k, None)
+                                persist_active_trades()
+            persist_active_trades()
         except Exception as e:
             print(f"Tracker error: {e}")
         time.sleep(TRACKER_INTERVAL)
@@ -1132,13 +1315,13 @@ def send_admin_panel(chat_id):
         pend_count = len(users_db["pending"])
         ban_count = len(users_db["banned"])
         g_state = "🟢 مفعل للجميع" if users_db["global_enabled"] else "🔴 متوقف عن المستخدمين"
-        curr_pass = users_db["password"]
+        curr_pass = "مضبوطة ومخزنة كتجزئة" if users_db["password"] else "غير مضبوطة"
         curr_email = users_db["admin_email"] or "غير مضبوط (يتم التأكيد عبر تيليجرام)"
 
     text = (
         f"🔐 *لوحة تحكم المشرف وإدارة المستخدمين*\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"🔑 *كلمة سر البوت الحالية:* `{curr_pass}`\n"
+        f"🔑 *حالة كلمة سر البوت:* `{curr_pass}`\n"
         f"📧 *إيميل التأكيد:* `{curr_email}`\n"
         f"🌐 *حالة البوت للمشتركين:* {g_state}\n"
         f"👥 *المفعلون:* `{app_count}` | *بانتظار الموافقة:* `{pend_count}` | *المحظورون:* `{ban_count}`\n"
@@ -1179,11 +1362,13 @@ def reject_or_delete_user_action(uid):
     send_msg("🚫 *عذراً، تم إيقاف صلاحية وصولك للبوت من قِبل الإدارة.*", uid, remove_keyboard=True)
     send_msg(f"🗑️ *تم حذف وحظر المستخدم:* `{info.get('name', uid)}` (`{uid}`).", ADMIN_CHAT_ID)
 
-def format_active_trades_report():
+def format_active_trades_report(chat_id=None):
     with trades_lock:
-        if not active_trades:
+        owner = str(chat_id) if chat_id is not None else None
+        snap = {k: dict(v) for k,v in active_trades.items()
+                if owner is None or str(v.get("user_id", "default")) == owner}
+        if not snap:
             return "📂 *لا توجد صفقات نشطة حالياً.*"
-        snap = dict(active_trades)
     lines = ["📂 *المناطق المراقبة تلقائياً (أهداف بالدولار TP1 / TP2 / TP3):*\n━━━━━━━━━━━━━━━━━━"]
     for k, t in snap.items():
         st = "⏳ بانتظار الملامسة" if t["status"] == "PENDING" else "🔥 مفعل بالسوق"
@@ -1224,6 +1409,7 @@ def telegram_listener():
                             cb = item["callback_query"]
                             cb_data = cb.get("data", "")
                             cb_chat = str(cb.get("message", {}).get("chat", {}).get("id", "")).strip()
+                            bind_settings_user(cb_chat)
                             requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb["id"]}, timeout=5)
 
                             if cb_data.startswith("ADM|") and is_admin(cb_chat):
@@ -1294,6 +1480,7 @@ def telegram_listener():
                             continue
                         chat_obj = msg.get("chat", {})
                         chat_id = str(chat_obj.get("id", "")).strip()
+                        bind_settings_user(chat_id)
                         full_name = f"{chat_obj.get('first_name', '')} {chat_obj.get('last_name', '')}".strip() or "مستخدم"
                         username = chat_obj.get("username", "بدون_معرف")
 
@@ -1305,9 +1492,9 @@ def telegram_listener():
                                 new_p = text.replace("/setpass ", "").strip()
                                 if new_p:
                                     with users_lock:
-                                        users_db["password"] = new_p
+                                        users_db["password"] = generate_password_hash(new_p)
                                         save_users_to_disk()
-                                    send_msg(f"🔑 *تم تغيير كلمة سر البوت بنجاح إلى:* `{new_p}`", chat_id)
+                                    send_msg("🔑 *تم تغيير كلمة سر البوت بنجاح.*", chat_id)
                                 continue
                             elif text.startswith("/setemail "):
                                 new_em = text.replace("/setemail ", "").strip()
@@ -1332,7 +1519,7 @@ def telegram_listener():
                                 send_msg("⏸️ *البوت متوقف مؤقتاً للصيانة بأمر من الإدارة.*", chat_id, remove_keyboard=True)
                                 continue
                             if not is_approved:
-                                if text.lower() == correct_pass.lower():
+                                if verify_bot_password(text, correct_pass):
                                     with users_lock:
                                         users_db["pending"][chat_id] = {
                                             "name": full_name,
@@ -1383,7 +1570,7 @@ def telegram_listener():
                         if text.startswith("/settp "):
                             try:
                                 nums = [float(x) for x in text.replace("/settp ", "").split() if x.strip()]
-                                if len(nums) >= 3:
+                                if len(nums) == 3 and all(math.isfinite(x) and 0 < x <= 100000 for x in nums) and nums[0] < nums[1] < nums[2]:
                                     user_settings["tp1_usd"] = round(nums[0], 2)
                                     user_settings["tp2_usd"] = round(nums[1], 2)
                                     user_settings["tp3_usd"] = round(nums[2], 2)
@@ -1404,7 +1591,7 @@ def telegram_listener():
                         elif text.startswith("/setsl "):
                             try:
                                 sl_val = float(text.replace("/setsl ", "").strip())
-                                if sl_val > 0:
+                                if math.isfinite(sl_val) and 0 < sl_val <= 100000:
                                     user_settings["sl_usd"] = round(sl_val, 2)
                                     send_msg(f"🛑 *تم ضبط وقف الخسارة على:* `-${user_settings['sl_usd']}`", chat_id)
                             except Exception:
@@ -1414,7 +1601,7 @@ def telegram_listener():
                         elif text.startswith("/setlot "):
                             try:
                                 lot_val = float(text.replace("/setlot ", "").strip())
-                                if lot_val >= 0.001:
+                                if math.isfinite(lot_val) and 0.001 <= lot_val <= 1000:
                                     user_settings["lot_size"] = round(lot_val, 3)
                                     send_msg(f"📦 *تم تغيير حجم اللوت إلى:* `{user_settings['lot_size']}`\nسيتم حساب المسافة السعرية للأهداف بناءً على هذا اللوت.", chat_id)
                             except Exception:
@@ -1468,10 +1655,11 @@ def telegram_listener():
                             analyze_and_send_zones("GOLD", user_settings["ltf"], chat_id)
                             analyze_and_send_zones("BTC", user_settings["ltf"], chat_id)
                         elif text in ["/trades", "📂 الأوامر المعلقة والنشطة"]:
-                            send_msg(format_active_trades_report(), chat_id)
+                            send_msg(format_active_trades_report(chat_id), chat_id)
                         elif text in ["/clear", "🗑️ مسح الصفقات"] and is_admin(chat_id):
                             with trades_lock:
                                 active_trades.clear()
+                                persist_active_trades()
                             send_msg("🗑️ تم مسح الصفقات.", chat_id)
         except Exception as e:
             print(f"Listener error: {e}")
@@ -1490,8 +1678,26 @@ def admin_email_action():
     uid = request.args.get("uid", "").strip()
     act = request.args.get("act", "").strip()
     tok = request.args.get("token", "").strip()
-    if not uid or act not in ["approve", "reject"] or tok != get_action_token(uid, act):
-        return "<h3>❌ رابط غير صالح</h3>", 403
+    if not uid or act not in ["approve", "reject"] or not admin_token_is_valid(uid, act, tok):
+        return "<h3>❌ الرابط غير صالح أو منتهي الصلاحية أو سبق استخدامه</h3>", 403
+    label = "الموافقة وتفعيل المستخدم" if act == "approve" else "رفض المستخدم وحظره"
+    return f"""<!doctype html><html lang="ar" dir="rtl"><meta charset="utf-8">
+    <title>تأكيد إجراء الإدارة</title><body style="font-family:Arial,sans-serif;margin:3rem">
+    <h2>تأكيد الإجراء</h2><p>هل تريد تنفيذ: {label}؟</p>
+    <form method="post" action="/admin/action">
+      <input type="hidden" name="uid" value="{html.escape(uid, quote=True)}">
+      <input type="hidden" name="act" value="{html.escape(act, quote=True)}">
+      <input type="hidden" name="token" value="{html.escape(tok, quote=True)}">
+      <button type="submit">تأكيد</button>
+    </form></body></html>"""
+
+@app.route("/admin/action", methods=["POST"])
+def admin_email_action_confirm():
+    uid = request.form.get("uid", "").strip()
+    act = request.form.get("act", "").strip()
+    tok = request.form.get("token", "").strip()
+    if not uid or act not in ["approve", "reject"] or not consume_admin_token(uid, act, tok):
+        return "<h3>❌ الرابط غير صالح أو منتهي الصلاحية أو سبق استخدامه</h3>", 403
     if act == "approve":
         approve_user_action(uid)
         return f"<h2 style='color:green;'>✅ تم تفعيل المستخدم ({uid}) بنجاح!</h2>"
@@ -1508,6 +1714,12 @@ def keep_alive_pinger():
             pass
 
 if __name__ == "__main__":
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is required; refusing to start without Telegram credentials")
+    if not ADMIN_CHAT_ID:
+        raise RuntimeError("TELEGRAM_CHAT_ID is required; refusing to start without an administrator")
+    if not BOT_PASSWORD:
+        raise RuntimeError("BOT_PASSWORD must be configured explicitly; insecure default passwords are disabled")
     threading.Thread(target=telegram_listener, daemon=True).start()
     threading.Thread(target=auto_zone_scanner_loop, daemon=True).start()
     threading.Thread(target=trade_tracker_loop, daemon=True).start()

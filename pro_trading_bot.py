@@ -34,6 +34,8 @@ TRACKER_INTERVAL = 15
 active_trades = {}
 trades_lock = threading.Lock()
 
+dxy_cache = {"timestamp": 0, "bias": "NEUTRAL", "text": "مستقر"}
+
 # ==================== نظام الحفظ الدائم وعزل إعدادات كل مستخدم ====================
 USERS_FILE = "users_store.json"
 users_lock = threading.RLock()
@@ -56,9 +58,9 @@ PROFIT_PROFILES = {
 }
 
 TIMEFRAME_MODES = {
-    "scalp": {"name": "سكالبينج سريع (5m / 15m) ⚡", "ltf": "5m", "htf": "15m"},
-    "intraday": {"name": "مضاربة يومية (15m / 4h) ⏱", "ltf": "15m", "htf": "4h"},
-    "swing": {"name": "طويل المدى Swing (4h / 1d) 🌊", "ltf": "4h", "htf": "1d"}
+    "scalp": {"name": "سكالبينج سريع (5m) ⚡", "ltf": "5m", "htf": "15m"},
+    "intraday": {"name": "مضاربة يومية (15m) ⏱", "ltf": "15m", "htf": "4h"},
+    "swing": {"name": "سوينق بعيد (4h) 🌊", "ltf": "4h", "htf": "1d"}
 }
 
 HTF_MAP = {
@@ -67,7 +69,7 @@ HTF_MAP = {
 
 def get_default_user_prefs():
     return {
-        "mode_name": "مضاربة متوسطة (15m / 4h)",
+        "mode_name": "مضاربة متوسطة (15m)",
         "ltf": "15m",
         "htf": "4h",
         "profit_style": "scalp",
@@ -124,7 +126,6 @@ def save_users_to_disk():
 users_db = load_users_from_disk()
 
 def get_user_settings(chat_id):
-    """إرجاع الإعدادات الخاصة بكل مستخدم بشكل مستقل تماماً عن بقية المشتركين"""
     cid = str(chat_id).strip()
     with users_lock:
         if cid not in users_db["user_prefs"]:
@@ -152,7 +153,7 @@ def usd_to_price_distance(sym_type, usd_amount, lot_size):
 
 app = Flask(__name__)
 
-# ==================== لوحة الأزرار السفلية المختصرة ====================
+# ==================== لوحة الأزرار السفلية المختصرة (صفان فقط) ====================
 USER_KEYBOARD = {
     "keyboard": [
         [{"text": "🪙 تحليل الذهب"}, {"text": "₿ تحليل البيتكوين"}],
@@ -226,9 +227,15 @@ def send_approval_email(user_id, full_name, username):
     except Exception as e:
         return False, str(e)
 
-def get_inline_tf_buttons(sym_type):
+def get_inline_tf_buttons(sym_type, is_long=True):
+    """أزرار الشارت الشفافة مع زر الدخول المباشر بالسعر الحالي (Market Execution)"""
+    mkt_dir = "BUY" if is_long else "SELL"
+    mkt_label = "⚡ دخول شراء مباشر بالسعر الحالي (Market)" if is_long else "⚡ دخول بيع مباشر بالسعر الحالي (Market)"
     return {
         "inline_keyboard": [
+            [
+                {"text": mkt_label, "callback_data": f"MKT|{sym_type}|{mkt_dir}"}
+            ],
             [
                 {"text": "⚡ 5m", "callback_data": f"TF|{sym_type}|5m"},
                 {"text": "⏱ 15m", "callback_data": f"TF|{sym_type}|15m"},
@@ -244,7 +251,6 @@ def get_inline_tf_buttons(sym_type):
     }
 
 def send_msg(text, chat_id, inline_markup=None, remove_keyboard=False):
-    """إرسال الرسالة حصرياً إلى المستخدم المحدد (chat_id) دون إرسالها للمشرف أو غيره"""
     target = str(chat_id).strip()
     if not TELEGRAM_BOT_TOKEN or not target:
         return
@@ -271,7 +277,7 @@ def send_msg(text, chat_id, inline_markup=None, remove_keyboard=False):
     except Exception as e:
         print(f"Telegram text error: {e}")
 
-# ==================== 2. محرك النطق البشري باللغة العربية (خاص بصاحب الصفقة فقط) ====================
+# ==================== 2. محرك النطق البشري باللغة العربية ====================
 def generate_fallback_alarm_wav(duration_sec=5.0):
     sample_rate = 12000
     num_samples = int(sample_rate * duration_sec)
@@ -304,7 +310,6 @@ def generate_arabic_tts_audio(spoken_text):
     return generate_fallback_alarm_wav().read(), "alert.wav", "audio/wav"
 
 def send_arabic_voice_alert(spoken_text, caption, chat_id):
-    """إرسال التنبيه الصوتي فقط إلى صاحب الصفقة (chat_id) لضمان الخصوصية الكاملة"""
     target = str(chat_id).strip()
     if not TELEGRAM_BOT_TOKEN or not target:
         return
@@ -320,11 +325,11 @@ def send_arabic_voice_alert(spoken_text, caption, chat_id):
     except Exception:
         send_msg(caption, target)
 
-def send_photo_msg(photo_buf, caption, sym_type, chat_id):
+def send_photo_msg(photo_buf, caption, sym_type, chat_id, is_long=True):
     target = str(chat_id).strip()
     if not TELEGRAM_BOT_TOKEN or not target:
         return
-    inline_kb = get_inline_tf_buttons(sym_type)
+    inline_kb = get_inline_tf_buttons(sym_type, is_long)
     if photo_buf is None:
         send_msg(caption, target, inline_kb)
         return
@@ -341,7 +346,7 @@ def send_photo_msg(photo_buf, caption, sym_type, chat_id):
     except Exception:
         send_msg(caption, target, inline_kb)
 
-# ==================== 3. جلب البيانات وحساب المؤشرات + Volume Profile POC ====================
+# ==================== 3. جلب البيانات + مؤشر الدولار DXY + المؤشرات العشر ====================
 def clean_yf_dataframe(raw):
     if raw is None or raw.empty:
         return pd.DataFrame()
@@ -416,6 +421,30 @@ def get_gold_ohlcv(timeframe):
             return df
     return pd.DataFrame()
 
+def get_dxy_correlation_bias():
+    now = time.time()
+    if now - dxy_cache["timestamp"] < 600:
+        return dxy_cache["bias"], dxy_cache["text"]
+
+    for sym in ["DX-Y.NYB", "UUP"]:
+        try:
+            df_dxy = get_yf_asset_ohlcv(sym, "15m")
+            if not df_dxy.empty and len(df_dxy) > 25:
+                closes = pd.to_numeric(df_dxy["close"], errors="coerce").dropna()
+                ema20 = closes.ewm(span=20, adjust=False).mean().iloc[-1]
+                ema50 = closes.ewm(span=50, adjust=False).mean().iloc[-1]
+                curr_dxy = float(closes.iloc[-1])
+                if curr_dxy < ema20 and ema20 <= ema50:
+                    dxy_cache.update({"timestamp": now, "bias": "WEAK_USD", "text": "ضعف الدولار DXY (يدعم الشراء)"})
+                elif curr_dxy > ema20 and ema20 >= ema50:
+                    dxy_cache.update({"timestamp": now, "bias": "STRONG_USD", "text": "قوة الدولار DXY (يدعم البيع)"})
+                else:
+                    dxy_cache.update({"timestamp": now, "bias": "NEUTRAL", "text": "استقرار مؤشر الدولار DXY"})
+                return dxy_cache["bias"], dxy_cache["text"]
+        except Exception:
+            continue
+    return "NEUTRAL", "حيادية مؤشر الدولار"
+
 def calc_parabolic_sar(df, af_start=0.02, af_step=0.02, af_max=0.20):
     high = df["high"].values
     low = df["low"].values
@@ -454,6 +483,50 @@ def calc_parabolic_sar(df, af_start=0.02, af_step=0.02, af_max=0.20):
                     af = min(af + af_step, af_max)
         psar[i] = sar
     return pd.Series(psar, index=df.index)
+
+def calc_supertrend(df, multiplier=3.0):
+    high = df["high"].values
+    low = df["low"].values
+    close = df["close"].values
+    atr = df["ATR"].values
+    n = len(df)
+
+    st = [0.0] * n
+    direction = [1] * n
+    hl2 = (high + low) / 2.0
+    basic_upper = hl2 + (multiplier * atr)
+    basic_lower = hl2 - (multiplier * atr)
+    final_upper = list(basic_upper)
+    final_lower = list(basic_lower)
+    st[0] = final_lower[0]
+
+    for i in range(1, n):
+        if basic_upper[i] < final_upper[i - 1] or close[i - 1] > final_upper[i - 1]:
+            final_upper[i] = basic_upper[i]
+        else:
+            final_upper[i] = final_upper[i - 1]
+
+        if basic_lower[i] > final_lower[i - 1] or close[i - 1] < final_lower[i - 1]:
+            final_lower[i] = basic_lower[i]
+        else:
+            final_lower[i] = final_lower[i - 1]
+
+        if direction[i - 1] == 1:
+            if close[i] < final_lower[i]:
+                direction[i] = -1
+                st[i] = final_upper[i]
+            else:
+                direction[i] = 1
+                st[i] = final_lower[i]
+        else:
+            if close[i] > final_upper[i]:
+                direction[i] = 1
+                st[i] = final_lower[i]
+            else:
+                direction[i] = -1
+                st[i] = final_upper[i]
+
+    return pd.Series(st, index=df.index), pd.Series(direction, index=df.index)
 
 def calculate_volume_profile(df, num_bins=24):
     recent = df.tail(55).copy()
@@ -534,6 +607,12 @@ def enrich_indicators(df):
     rs = gain / loss.replace(0, 1e-9)
     df["RSI"] = 100 - (100 / (1 + rs))
 
+    rsi_min = df["RSI"].rolling(window=14, min_periods=1).min()
+    rsi_max = df["RSI"].rolling(window=14, min_periods=1).max()
+    stoch_raw = 100 * ((df["RSI"] - rsi_min) / (rsi_max - rsi_min).replace(0, 1e-9))
+    df["STOCH_K"] = stoch_raw.rolling(window=3, min_periods=1).mean()
+    df["STOCH_D"] = df["STOCH_K"].rolling(window=3, min_periods=1).mean()
+
     high_low = df["high"] - df["low"]
     high_close = (df["high"] - df["close"].shift(1)).abs()
     low_close = (df["low"] - df["close"].shift(1)).abs()
@@ -551,6 +630,7 @@ def enrich_indicators(df):
     df["ADX"] = dx.ewm(alpha=1/14, adjust=False).mean().fillna(20.0)
 
     df["PSAR"] = calc_parabolic_sar(df)
+    df["SUPERTREND"], df["ST_DIR"] = calc_supertrend(df, multiplier=2.8)
 
     typical_price = (df["high"] + df["low"] + df["close"]) / 3.0
     vol_safe = df["volume"].replace(0, 1.0)
@@ -562,93 +642,149 @@ def enrich_indicators(df):
     df["BB_LOWER"] = df["BB_MID"] - (2.0 * bb_std)
     df["BB_WIDTH"] = (df["BB_UPPER"] - df["BB_LOWER"]) / df["BB_MID"].replace(0, 1e-9)
 
+    candle_range = (df["high"] - df["low"]).replace(0, 1e-9)
+    delta_ratio = ((df["close"] - df["low"]) - (df["high"] - df["close"])) / candle_range
+    eff_vol = df["volume"].where(df["volume"] > 0, high_low * 100.0)
+    df["VOL_DELTA"] = delta_ratio * eff_vol
+    df["CVD"] = df["VOL_DELTA"].cumsum()
+
     return df
 
-# ==================== 4. محرك الاستراتيجيات الخمس ====================
-def evaluate_multi_strategies(ltf, htf, div_info, bos_events, vp_data):
-    curr = ltf.iloc[-1]
-    h_curr = htf.iloc[-1]
-
+# ==================== 4. الفلاتر المؤسسية الإضافية ====================
+def analyze_session_and_candle_filters(df):
+    recent = df.tail(60).reset_index(drop=True)
+    curr = recent.iloc[-1]
+    prev = recent.iloc[-2]
     price = float(curr["close"])
-    adx = round(float(curr["ADX"]), 1)
-    psar_val = round(float(curr["PSAR"]), 2)
-    vwap_val = round(float(curr["VWAP"]), 2)
-    poc_val = vp_data["poc"]
-    vah_val = vp_data["vah"]
-    val_val = vp_data["val"]
 
-    htf_bull = float(h_curr["close"]) > float(h_curr["EMA_200"])
-    ema_bull = price > float(curr["EMA_50"])
-    psar_bull = price > psar_val
-    vwap_bull = price > vwap_val
-    macd_bull = float(curr["MACD"]) > float(curr["MACD_SIGNAL"])
-    poc_bull = price >= poc_val
+    session_slice = recent.iloc[-36:-4] if len(recent) > 36 else recent.iloc[:-3]
+    sess_high = round(float(session_slice["high"].max()), 2)
+    sess_low = round(float(session_slice["low"].min()), 2)
 
-    s1_bull = htf_bull and (ema_bull or any(e["bias"] == "BULL" for e in bos_events))
-    s1_status = "🟢 شراء (توافق هيكل SMC + OTE)" if s1_bull else "🔴 بيع (ضغط عرض SMC + OTE)"
+    last_4_low = float(recent["low"].tail(4).min())
+    last_4_high = float(recent["high"].tail(4).max())
 
-    recent_15 = ltf.tail(15)
-    prev_low_15 = float(recent_15["low"].iloc[:-2].min())
-    prev_high_15 = float(recent_15["high"].iloc[:-2].max())
-    c1, c2, c3 = ltf.iloc[-3], ltf.iloc[-2], ltf.iloc[-1]
+    bull_session_sweep = (last_4_low <= sess_low) and (price > sess_low)
+    bear_session_sweep = (last_4_high >= sess_high) and (price < sess_high)
 
-    bull_fvg = float(c3["low"]) > float(c1["high"]) and float(c2["close"]) > float(c2["open"])
-    bear_fvg = float(c3["high"]) < float(c1["low"]) and float(c2["close"]) < float(c2["open"])
-    bull_sweep = float(recent_15["low"].tail(3).min()) <= prev_low_15 and price > prev_low_15
-    bear_sweep = float(recent_15["high"].tail(3).max()) >= prev_high_15 and price < prev_high_15
+    cvd_now = float(recent["CVD"].iloc[-1])
+    cvd_prev = float(recent["CVD"].iloc[-6]) if len(recent) > 6 else cvd_now
+    price_prev = float(recent["close"].iloc[-6]) if len(recent) > 6 else price
 
-    utc_hour = time.gmtime().tm_hour
-    in_killzone = (7 <= utc_hour <= 11) or (12 <= utc_hour <= 16)
-    kz_tag = "وقت سيولة Killzone 🔥" if in_killzone else "جلسة عادية"
+    bull_absorption = (price <= price_prev) and (cvd_now > cvd_prev)
+    bear_absorption = (price >= price_prev) and (cvd_now < cvd_prev)
+    cvd_bull = (cvd_now > cvd_prev) or bull_absorption
 
-    if bull_sweep or bull_fvg:
-        s2_bull = True
-        s2_status = f"🟢 شراء ICT ({'سحب سيولة SSL' if bull_sweep else 'فجوة FVG صاعدة'} | {kz_tag})"
-    elif bear_sweep or bear_fvg:
-        s2_bull = False
-        s2_status = f"🔴 بيع ICT ({'سحب سيولة BSL' if bear_sweep else 'فجوة FVG هابطة'} | {kz_tag})"
-    else:
-        s2_bull = ema_bull
-        s2_status = f"⚖️ انتظار سحب سيولة ({kz_tag})"
+    c_open, c_close = float(curr["open"]), float(curr["close"])
+    c_high, c_low = float(curr["high"]), float(curr["low"])
+    body = max(abs(c_close - c_open), 1e-4)
+    lower_wick = min(c_open, c_close) - c_low
+    upper_wick = c_high - max(c_open, c_close)
 
-    s3_bull = psar_bull
-    s3_status = f"🟢 صاعد أعلى SAR (`{psar_val}`) | ADX: `{adx}`" if s3_bull else f"🔴 هابط أسفل SAR (`{psar_val}`) | ADX: `{adx}`"
-
-    avg_bb_width = float(ltf["BB_WIDTH"].tail(40).mean())
-    is_squeeze = float(curr["BB_WIDTH"]) < (avg_bb_width * 0.85)
-    sq_txt = "⚡ انضغاط انفجاري" if is_squeeze else "تمدد طبيعي"
-    s4_bull = vwap_bull and macd_bull
-    s4_status = f"🟢 أعلى VWAP (`{vwap_val}`) | {sq_txt}" if vwap_bull else f"🔴 أسفل VWAP (`{vwap_val}`) | {sq_txt}"
-
-    s5_bull = poc_bull
-    vp_loc = "اختراق شرائي أعلى VAH" if price > vah_val else ("كسر بيعي أسفل VAL" if price < val_val else "داخل منطقة القيمة")
-    s5_status = f"🟢 ارتكاز أعلى POC (`{poc_val}`) — {vp_loc}" if s5_bull else f"🔴 ضغط أسفل POC (`{poc_val}`) — {vp_loc}"
-
-    bull_votes = sum([1 if s1_bull else 0, 1 if s2_bull else 0, 1 if s3_bull else 0, 1 if s4_bull else 0, 1 if s5_bull else 0])
-    if div_info["found"] and div_info["rsi_div"]:
-        bull_votes += 1 if div_info["rsi_div"]["bias"] == "BULL" else -1
-
-    final_is_long = bull_votes >= 3
-    aligned_count = sum([
-        1 if s1_bull == final_is_long else 0,
-        1 if s2_bull == final_is_long else 0,
-        1 if s3_bull == final_is_long else 0,
-        1 if s4_bull == final_is_long else 0,
-        1 if s5_bull == final_is_long else 0
-    ])
-    confidence = min(60 + (aligned_count * 7) + (4 if in_killzone else 0), 99)
+    bull_pin = lower_wick >= (1.6 * body)
+    bear_pin = upper_wick >= (1.6 * body)
+    bull_engulf = (c_close > c_open) and (float(prev["close"]) < float(prev["open"])) and (c_close >= float(prev["open"]))
+    bear_engulf = (c_close < c_open) and (float(prev["close"]) > float(prev["open"])) and (c_close <= float(prev["open"]))
 
     return {
-        "is_long": final_is_long, "aligned_count": aligned_count, "confidence": confidence,
-        "psar": psar_val, "vwap": vwap_val, "poc": poc_val, "vah": vah_val, "val": val_val,
-        "s1_status": s1_status, "s2_status": s2_status, "s3_status": s3_status, "s4_status": s4_status, "s5_status": s5_status
+        "sess_high": sess_high,
+        "sess_low": sess_low,
+        "bull_session_sweep": bull_session_sweep,
+        "bear_session_sweep": bear_session_sweep,
+        "cvd_bull": cvd_bull,
+        "bull_absorption": bull_absorption,
+        "bear_absorption": bear_absorption,
+        "bull_candle": (bull_pin or bull_engulf),
+        "bear_candle": (bear_pin or bear_engulf)
     }
 
-# ==================== 5. كشف الدايفرجنس وهيكل السوق ومحرك الاقتناص القريب ====================
+# ==================== 5. المحرك الشامل لعشر استراتيجيات ====================
+def evaluate_10_strategies_clean(ltf, htf, div_info, bos_events, vp_data):
+    curr = ltf.iloc[-1]
+    h_curr = htf.iloc[-1]
+    price = float(curr["close"])
+
+    poc_val = vp_data["poc"]
+    vwap_val = round(float(curr["VWAP"]), 2)
+    st_dir = int(curr["ST_DIR"])
+    stoch_k = float(curr["STOCH_K"])
+
+    extra = analyze_session_and_candle_filters(ltf)
+    dxy_bias, dxy_txt = get_dxy_correlation_bias()
+
+    s1_bull = (float(h_curr["close"]) > float(h_curr["EMA_200"])) or (price > float(curr["EMA_50"]))
+    c1, c3 = ltf.iloc[-3], ltf.iloc[-1]
+    s2_bull = (float(c3["low"]) > float(c1["high"])) or extra["bull_session_sweep"] or (price > float(curr["EMA_20"]))
+    s3_bull = price > float(curr["PSAR"])
+    s4_bull = (price >= vwap_val) and (float(curr["MACD"]) >= float(curr["MACD_SIGNAL"]))
+    s5_bull = price >= poc_val
+    s6_bull = (st_dir == 1) or (stoch_k < 30)
+    s7_bull = extra["cvd_bull"]
+    s8_bull = True if extra["bull_session_sweep"] else (False if extra["bear_session_sweep"] else s1_bull)
+    s9_bull = True if dxy_bias == "WEAK_USD" else (False if dxy_bias == "STRONG_USD" else s1_bull)
+    if div_info["found"] and div_info["rsi_div"]:
+        s10_bull = (div_info["rsi_div"]["bias"] == "BULL")
+    else:
+        s10_bull = True if extra["bull_candle"] else (False if extra["bear_candle"] else s1_bull)
+
+    flags = [s1_bull, s2_bull, s3_bull, s4_bull, s5_bull, s6_bull, s7_bull, s8_bull, s9_bull, s10_bull]
+    bull_score = sum(1 for f in flags if f)
+    final_is_long = bull_score >= 5
+    aligned_count = bull_score if final_is_long else (10 - bull_score)
+    confidence = min(58 + (aligned_count * 4), 98)
+
+    reasons = []
+    if final_is_long:
+        if s5_bull:
+            reasons.append(f"ارتكاز أعلى سيولة POC ({poc_val})")
+        if s6_bull:
+            reasons.append("اتجاه Supertrend صاعد")
+        if extra["bull_absorption"] or s7_bull:
+            reasons.append("تجميع شرائي في دلتا السيولة CVD")
+        if dxy_bias == "WEAK_USD":
+            reasons.append("ضعف مؤشر الدولار DXY")
+        if extra["bull_session_sweep"]:
+            reasons.append("سحب سيولة قاع الجلسة")
+        if extra["bull_candle"]:
+            reasons.append("ظهور شمعة رفض شرائية")
+    else:
+        if not s5_bull:
+            reasons.append(f"تداول أسفل سيولة POC ({poc_val})")
+        if not s6_bull:
+            reasons.append("اتجاه Supertrend هابط")
+        if extra["bear_absorption"] or not s7_bull:
+            reasons.append("تصريف بيعي في دلتا السيولة CVD")
+        if dxy_bias == "STRONG_USD":
+            reasons.append("قوة مؤشر الدولار DXY")
+        if extra["bear_session_sweep"]:
+            reasons.append("سحب سيولة قمة الجلسة")
+        if extra["bear_candle"]:
+            reasons.append("ظهور شمعة رفض بيعية")
+
+    if not reasons:
+        reasons = ["توافق المتوسطات السعرية", "هيكل السوق اللحظي"]
+
+    top_reasons_text = " + ".join(reasons[:3])
+    stars = "⭐⭐⭐⭐⭐" if aligned_count >= 8 else ("⭐⭐⭐⭐" if aligned_count >= 6 else "⭐⭐⭐")
+
+    return {
+        "is_long": final_is_long,
+        "aligned_count": aligned_count,
+        "confidence": confidence,
+        "stars": stars,
+        "summary_reasons": top_reasons_text,
+        "dxy_text": dxy_txt,
+        "cvd_state": "شرائية 🟢" if s7_bull else "بيعية 🔴",
+        "poc": poc_val,
+        "sess_high": extra["sess_high"],
+        "sess_low": extra["sess_low"]
+    }
+
+# ==================== 6. كشف الدايفرجنس ومحرك الاقتناص القريب ====================
 def detect_rsi_macd_divergence(plot_df):
     n = len(plot_df)
     if n < 20:
-        return {"found": False, "text": "حيادي", "rsi_div": None, "macd_div": None}
+        return {"found": False, "text": "حيادي", "rsi_div": None}
     piv_lows, piv_highs = [], []
     for i in range(2, n - 1):
         l, h = float(plot_df["low"].iloc[i]), float(plot_df["high"].iloc[i])
@@ -659,35 +795,21 @@ def detect_rsi_macd_divergence(plot_df):
             if not piv_highs or (i - piv_highs[-1]) >= 4:
                 piv_highs.append(i)
 
-    rsi_res, macd_res = None, None
+    rsi_res = None
     if len(piv_lows) >= 2:
         i1, i2 = piv_lows[-2], piv_lows[-1]
         p1, p2 = float(plot_df["low"].iloc[i1]), float(plot_df["low"].iloc[i2])
         r1, r2 = float(plot_df["RSI"].iloc[i1]), float(plot_df["RSI"].iloc[i2])
-        m1, m2 = float(plot_df["MACD"].iloc[i1]), float(plot_df["MACD"].iloc[i2])
-        if (p2 < p1 and r2 > r1) or (p2 > p1 and r2 < r1):
-            rsi_res = {"found": True, "bias": "BULL", "label": "RSI Bull Div", "x1": i1, "x2": i2, "p1": p1, "p2": p2, "v1": r1, "v2": r2, "color": "#00e676"}
-        if (p2 < p1 and m2 > m1) or (p2 > p1 and m2 < m1):
-            macd_res = {"found": True, "bias": "BULL", "label": "MACD Bull Div", "x1": i1, "x2": i2, "p1": p1, "p2": p2, "v1": m1, "v2": m2, "color": "#00e676"}
-
+        if p2 < p1 and r2 > r1:
+            rsi_res = {"found": True, "bias": "BULL", "label": "دايفرجنس شرائي"}
     if len(piv_highs) >= 2:
         i1, i2 = piv_highs[-2], piv_highs[-1]
         p1, p2 = float(plot_df["high"].iloc[i1]), float(plot_df["high"].iloc[i2])
         r1, r2 = float(plot_df["RSI"].iloc[i1]), float(plot_df["RSI"].iloc[i2])
-        m1, m2 = float(plot_df["MACD"].iloc[i1]), float(plot_df["MACD"].iloc[i2])
-        if (p2 > p1 and r2 < r1) or (p2 < p1 and r2 > r1):
-            rsi_res = {"found": True, "bias": "BEAR", "label": "RSI Bear Div", "x1": i1, "x2": i2, "p1": p1, "p2": p2, "v1": r1, "v2": r2, "color": "#ff5252"}
-        if (p2 > p1 and m2 < m1) or (p2 < p1 and m2 > m1):
-            macd_res = {"found": True, "bias": "BEAR", "label": "MACD Bear Div", "x1": i1, "x2": i2, "p1": p1, "p2": p2, "v1": m1, "v2": m2, "color": "#ff5252"}
+        if p2 > p1 and r2 < r1:
+            rsi_res = {"found": True, "bias": "BEAR", "label": "دايفرجنس بيعي"}
 
-    txt = "حيادي"
-    if rsi_res and macd_res:
-        txt = "🌟 دايفرجنس مزدوج مؤكد (RSI + MACD)"
-    elif rsi_res:
-        txt = f"🟢 دايفرجنس RSI ({rsi_res['label']})"
-    elif macd_res:
-        txt = f"🔵 دايفرجنس MACD ({macd_res['label']})"
-    return {"found": bool(rsi_res or macd_res), "text": txt, "rsi_div": rsi_res, "macd_div": macd_res}
+    return {"found": bool(rsi_res), "text": rsi_res["label"] if rsi_res else "حيادي", "rsi_div": rsi_res}
 
 def detect_bos_choch(plot_df):
     n = len(plot_df)
@@ -702,9 +824,9 @@ def detect_bos_choch(plot_df):
             piv_lows.append((i, l))
     events = []
     if len(piv_highs) >= 2 and float(plot_df["close"].iloc[-1]) > piv_highs[-2][1]:
-        events.append({"type": "BOS/CHoCH", "bias": "BULL", "level": piv_highs[-2][1], "text": "BOS/CHoCH BULL", "color": "#00e676"})
+        events.append({"bias": "BULL", "level": piv_highs[-2][1]})
     if len(piv_lows) >= 2 and float(plot_df["close"].iloc[-1]) < piv_lows[-2][1]:
-        events.append({"type": "BOS/CHoCH", "bias": "BEAR", "level": piv_lows[-2][1], "text": "BOS/CHoCH BEAR", "color": "#ff5252"})
+        events.append({"bias": "BEAR", "level": piv_lows[-2][1]})
     return events
 
 def analyze_structure_and_ote(df, is_long_bias, sym_type, vp_data, u_prefs):
@@ -713,18 +835,6 @@ def analyze_structure_and_ote(df, is_long_bias, sym_type, vp_data, u_prefs):
     curr_price = float(curr_row["close"])
     atr = max(float(curr_row["ATR"]), curr_price * 0.0008)
     rsi = float(curr_row["RSI"])
-
-    swing_high_55 = float(recent_55["high"].max())
-    swing_low_55 = float(recent_55["low"].min())
-    if swing_high_55 - swing_low_55 < (1.5 * atr):
-        swing_high_55 = curr_price + (2.5 * atr)
-        swing_low_55 = curr_price - (2.5 * atr)
-
-    eq_50 = round(swing_low_55 + 0.50 * (swing_high_55 - swing_low_55), 2)
-    demand_bottom = round(swing_low_55, 2)
-    demand_top = round(swing_low_55 + (0.6 * atr), 2)
-    supply_bottom = round(swing_high_55 - (0.6 * atr), 2)
-    supply_top = round(swing_high_55, 2)
 
     is_swing_mode = (u_prefs.get("profit_style") == "swing") or (u_prefs.get("ltf") in ["4h", "1d"])
     micro_window = 22 if is_swing_mode else 12
@@ -751,6 +861,7 @@ def analyze_structure_and_ote(df, is_long_bias, sym_type, vp_data, u_prefs):
 
     ema20_val = float(curr_row["EMA_20"])
     vwap_val = float(curr_row["VWAP"])
+    st_val = float(curr_row["SUPERTREND"])
     poc_val = float(vp_data["poc"]) if vp_data and "poc" in vp_data else curr_price
 
     micro_fvg_anchor = None
@@ -773,6 +884,7 @@ def analyze_structure_and_ote(df, is_long_bias, sym_type, vp_data, u_prefs):
             (ema20_val, "ارتكاز المتوسط السريع EMA 20"),
             (vwap_val, "خط السيولة المؤسسي VWAP"),
             (poc_val, "نقطة التحكم بالحجم POC"),
+            (st_val, "دعم خط Supertrend"),
             (fib_382, "تصحيح فيبوناتشي القريب 38.2%"),
             (fib_500, "توازن الموجة الفرعية 50%"),
             (prev_candle_low, "سحب سيولة الشمعة السابقة")
@@ -793,8 +905,7 @@ def analyze_structure_and_ote(df, is_long_bias, sym_type, vp_data, u_prefs):
         else:
             pullback_d = max_dist if rsi > 68 else ideal_dist
             sniper_mid = curr_price - pullback_d
-            anchor_reason = "تراجع تصحيحي آمن (Micro OTE Pullback)"
-
+            anchor_reason = "تراجع تصحيحي آمن (Micro OTE)"
     else:
         fib_382 = curr_price + (0.382 * micro_span)
         fib_500 = curr_price + (0.500 * micro_span)
@@ -804,6 +915,7 @@ def analyze_structure_and_ote(df, is_long_bias, sym_type, vp_data, u_prefs):
             (ema20_val, "مقاومة المتوسط السريع EMA 20"),
             (vwap_val, "خط السيولة المؤسسي VWAP"),
             (poc_val, "نقطة التحكم بالحجم POC"),
+            (st_val, "مقاومة خط Supertrend"),
             (fib_382, "تصحيح فيبوناتشي القريب 38.2%"),
             (fib_500, "توازن الموجة الفرعية 50%"),
             (prev_candle_high, "سحب سيولة قمة الشمعة السابقة")
@@ -824,126 +936,91 @@ def analyze_structure_and_ote(df, is_long_bias, sym_type, vp_data, u_prefs):
         else:
             pullback_d = max_dist if rsi < 32 else ideal_dist
             sniper_mid = curr_price + pullback_d
-            anchor_reason = "ارتداد تصحيحي آمن (Micro OTE Pullback)"
+            anchor_reason = "ارتداد تصحيحي آمن (Micro OTE)"
 
     sniper_mid = round(sniper_mid, 2)
     sniper_zone = (round(sniper_mid - half_band, 2), round(sniper_mid + half_band, 2))
-    ote_zone = (round(sniper_mid - (1.4 * half_band), 2), round(sniper_mid + (1.4 * half_band), 2))
     dist_from_curr = round(abs(curr_price - sniper_mid), 2)
 
     return {
-        "bsl": round(swing_high_55, 2),
-        "ssl": round(swing_low_55, 2),
-        "eq_50": eq_50,
-        "ote_zone": ote_zone,
-        "ote_sweet": sniper_mid,
+        "sniper_mid": sniper_mid,
         "sniper_zone": sniper_zone,
         "anchor_reason": anchor_reason,
-        "dist_from_curr": dist_from_curr,
-        "demand_zone": (demand_bottom, demand_top),
-        "supply_zone": (supply_bottom, supply_top)
+        "dist_from_curr": dist_from_curr
     }
 
-# ==================== 6. رسم الشارت المتكامل ====================
-def generate_chart_image(df, zones, vp_data, div_info, bos_events, asset_title, entry_zone, sl, exit_targets, usd_targets, lot_size, is_long=True):
+# ==================== 7. رسم الشارت المبسط والنقي جداً ====================
+def generate_clean_chart_image(df, zones, vp_data, strat_res, asset_title, entry_zone, sl, exit_targets, usd_targets, is_market=False):
     try:
-        plot_df = df.tail(55).reset_index(drop=True)
-        fig, (ax, ax_rsi, ax_macd) = plt.subplots(
-            3, 1, figsize=(10.8, 9.4), dpi=115, sharex=True,
-            gridspec_kw={"height_ratios": [3.5, 1.0, 1.0], "hspace": 0.08}
-        )
+        plot_df = df.tail(45).reset_index(drop=True)
+        fig, ax = plt.subplots(figsize=(10.2, 5.8), dpi=120)
         fig.patch.set_facecolor("#131722")
-        for a in [ax, ax_rsi, ax_macd]:
-            a.set_facecolor("#131722")
-
-        max_v = max(vp_data["bin_volumes"]) if vp_data["bin_volumes"] else 1.0
-        for b_i, (b_center, b_vol) in enumerate(zip(vp_data["bin_centers"], vp_data["bin_volumes"])):
-            bar_w = (b_vol / max(max_v, 1e-9)) * 14.0
-            is_poc_bar = (b_i == vp_data["poc_idx"])
-            bar_col = "#00e5ff" if is_poc_bar else "#5c6bc0"
-            bar_alpha = 0.55 if is_poc_bar else 0.25
-            ax.barh(b_center, bar_w, height=vp_data["bin_height"], left=-1.0, color=bar_col, alpha=bar_alpha, edgecolor=bar_col, zorder=2)
-
-        poc_p = vp_data["poc"]
-        vah_p = vp_data["vah"]
-        val_p = vp_data["val"]
-        x_end = len(plot_df) + 4
-        ax.set_xlim(-1.2, x_end + 9)
-
-        ax.axhline(poc_p, color="#00e5ff", linestyle="-", linewidth=1.7, alpha=0.95, label=f"POC ({poc_p})", zorder=4)
-        ax.axhline(vah_p, color="#00b0ff", linestyle=":", linewidth=0.9, alpha=0.75, zorder=2)
-        ax.axhline(val_p, color="#00b0ff", linestyle=":", linewidth=0.9, alpha=0.75, zorder=2)
-        ax.text(x_end + 0.2, poc_p, f" POC: {poc_p}", color="#00e5ff", fontsize=8, va="center", fontweight="bold")
+        ax.set_facecolor("#131722")
 
         for idx, row in plot_df.iterrows():
             o, h, l, c = float(row["open"]), float(row["high"]), float(row["low"]), float(row["close"])
             color = "#26a69a" if c >= o else "#ef5350"
-            ax.plot([idx, idx], [l, h], color=color, linewidth=1.1, zorder=3)
-            ax.bar(idx, max(abs(c - o), (h - l) * 0.02, 1e-4), bottom=min(o, c), width=0.62, color=color, edgecolor=color, zorder=4)
+            ax.plot([idx, idx], [l, h], color=color, linewidth=1.2, zorder=3)
+            ax.bar(idx, max(abs(c - o), (h - l) * 0.02, 1e-4), bottom=min(o, c), width=0.60, color=color, edgecolor=color, zorder=4)
 
-        if "PSAR" in plot_df.columns:
-            psar_colors = ["#00e676" if plot_df["close"].iloc[i] >= plot_df["PSAR"].iloc[i] else "#ff5252" for i in range(len(plot_df))]
-            ax.scatter(plot_df.index, plot_df["PSAR"], c=psar_colors, s=11, alpha=0.9, label="Parabolic SAR", zorder=5)
-        if "VWAP" in plot_df.columns:
-            ax.plot(plot_df.index, plot_df["VWAP"], color="#e040fb", linewidth=1.3, linestyle="-.", label="VWAP", zorder=5)
+        x_end = len(plot_df) + 2
+        ax.set_xlim(-1, x_end + 11)
 
-        d_low, d_high = zones["demand_zone"]
-        s_low, s_high = zones["supply_zone"]
-        ax.add_patch(patches.Rectangle((0, d_low), width=x_end, height=max(d_high - d_low, 1e-3), facecolor="#00e676", alpha=0.12, edgecolor="#00e676", linewidth=1, zorder=1))
-        ax.add_patch(patches.Rectangle((0, s_low), width=x_end, height=max(s_high - s_low, 1e-3), facecolor="#ff5252", alpha=0.12, edgecolor="#ff5252", linewidth=1, zorder=1))
+        if "SUPERTREND" in plot_df.columns:
+            for i in range(1, len(plot_df)):
+                st_c = "#00e676" if int(plot_df["ST_DIR"].iloc[i]) == 1 else "#ff5252"
+                ax.plot([i - 1, i], [plot_df["SUPERTREND"].iloc[i - 1], plot_df["SUPERTREND"].iloc[i]], color=st_c, linewidth=1.6, alpha=0.85, zorder=3)
 
-        ote_low, ote_high = zones["ote_zone"]
-        ax.add_patch(patches.Rectangle((len(plot_df) - 18, ote_low), width=22, height=max(ote_high - ote_low, 1e-3), facecolor="#ffd700", alpha=0.26, edgecolor="#ffd700", linestyle="--", linewidth=1.3, zorder=2))
-        ax.axhline(zones["ote_sweet"], color="#ffd700", linestyle=":", linewidth=1.1, alpha=0.95)
-        ax.text(len(plot_df) - 17, zones["ote_sweet"], f" SMART ENTRY ZONE: {zones['ote_sweet']}", color="#ffd700", fontsize=7.5, va="bottom", fontweight="bold")
+        poc_p = vp_data["poc"]
+        ax.axhline(poc_p, color="#00e5ff", linestyle=":", linewidth=1.2, alpha=0.75, zorder=2)
+        ax.text(0.5, poc_p, f" POC: {poc_p}", color="#00e5ff", fontsize=7.8, va="bottom", fontweight="bold")
 
-        for ev in bos_events:
-            ax.axhline(ev["level"], color=ev["color"], linestyle="--", linewidth=1.1, alpha=0.9, zorder=4)
-            ax.text(len(plot_df) - 12, ev["level"], f" {ev['text']}", color=ev["color"], fontsize=7.5, va="bottom", fontweight="bold")
+        z_low, z_high = entry_zone
+        e_mid = zones["sniper_mid"]
+        if not is_market:
+            ax.add_patch(
+                patches.Rectangle(
+                    (len(plot_df) - 14, z_low),
+                    width=16,
+                    height=max(z_high - z_low, 1e-3),
+                    facecolor="#ffd700",
+                    alpha=0.28,
+                    edgecolor="#ffd700",
+                    linestyle="--",
+                    linewidth=1.4,
+                    zorder=2
+                )
+            )
 
-        e_mid = round((entry_zone[0] + entry_zone[1]) / 2, 2)
         tp1, tp2, tp3 = exit_targets
         u1, u2, u3, u_sl = usd_targets
 
-        ax.axhline(e_mid, color="#ffffff", linestyle="--", linewidth=1.2, alpha=0.95)
-        ax.axhline(sl, color="#ff1744", linestyle="-", linewidth=1.3, alpha=0.95)
-        ax.axhline(tp1, color="#26a69a", linestyle="--", linewidth=1.1, alpha=0.9)
-        ax.axhline(tp2, color="#00e676", linestyle="--", linewidth=1.2, alpha=0.95)
-        ax.axhline(tp3, color="#69f0ae", linestyle="-", linewidth=1.4, alpha=0.98)
+        entry_line_col = "#00e5ff" if is_market else "#ffd700"
+        entry_tag = f" MARKET NOW: {e_mid}" if is_market else f" ENTRY: {e_mid}"
 
-        label_x = x_end + 0.2
-        ax.text(label_x, e_mid, f" ENTRY: {e_mid}", color="#ffffff", fontsize=7.8, va="center", fontweight="bold")
-        ax.text(label_x, sl, f" SL (-${u_sl}): {sl}", color="#ff1744", fontsize=7.8, va="center", fontweight="bold")
-        ax.text(label_x, tp1, f" TP1 (+${u1}): {tp1}", color="#26a69a", fontsize=7.8, va="center", fontweight="bold")
-        ax.text(label_x, tp2, f" TP2 (+${u2}): {tp2}", color="#00e676", fontsize=7.8, va="center", fontweight="bold")
-        ax.text(label_x, tp3, f" TP3 (+${u3}): {tp3}", color="#69f0ae", fontsize=7.8, va="center", fontweight="bold")
-        ax.legend(loc="upper left", facecolor="#1e222d", edgecolor="#2a2e39", labelcolor="#ffffff", fontsize=7.5)
+        ax.axhline(e_mid, color=entry_line_col, linestyle="-" if is_market else "--", linewidth=1.5, alpha=0.98, zorder=5)
+        ax.axhline(sl, color="#ff1744", linestyle="-", linewidth=1.4, alpha=0.95, zorder=5)
+        ax.axhline(tp1, color="#26a69a", linestyle="--", linewidth=1.2, alpha=0.90, zorder=5)
+        ax.axhline(tp2, color="#00e676", linestyle="--", linewidth=1.2, alpha=0.95, zorder=5)
+        ax.axhline(tp3, color="#69f0ae", linestyle="-", linewidth=1.5, alpha=0.98, zorder=5)
 
-        ax_rsi.plot(plot_df.index, plot_df["RSI"], color="#ab47bc", linewidth=1.3)
-        ax_rsi.axhline(70, color="#ef5350", linestyle=":", linewidth=0.8)
-        ax_rsi.axhline(30, color="#26a69a", linestyle=":", linewidth=0.8)
-        ax_rsi.set_ylabel("RSI", color="#b2b5be", fontsize=8)
-        if div_info and div_info.get("rsi_div"):
-            r_d = div_info["rsi_div"]
-            ax.plot([r_d["x1"], r_d["x2"]], [r_d["p1"], r_d["p2"]], color=r_d["color"], linewidth=2.0, marker="o", markersize=3, zorder=6)
-            ax_rsi.plot([r_d["x1"], r_d["x2"]], [r_d["v1"], r_d["v2"]], color=r_d["color"], linewidth=2.0, marker="o", markersize=3, zorder=6)
+        label_x = x_end + 0.3
+        ax.text(label_x, e_mid, entry_tag, color=entry_line_col, fontsize=8.5, va="center", fontweight="bold")
+        ax.text(label_x, sl, f" SL (-${u_sl}): {sl}", color="#ff1744", fontsize=8.5, va="center", fontweight="bold")
+        ax.text(label_x, tp1, f" TP1 (+${u1}): {tp1}", color="#26a69a", fontsize=8.5, va="center", fontweight="bold")
+        ax.text(label_x, tp2, f" TP2 (+${u2}): {tp2}", color="#00e676", fontsize=8.5, va="center", fontweight="bold")
+        ax.text(label_x, tp3, f" TP3 (+${u3}): {tp3}", color="#69f0ae", fontsize=8.5, va="center", fontweight="bold")
 
-        hist_colors = ["#26a69a" if v >= 0 else "#ef5350" for v in plot_df["MACD_HIST"]]
-        ax_macd.bar(plot_df.index, plot_df["MACD_HIST"], color=hist_colors, width=0.6, alpha=0.75)
-        ax_macd.plot(plot_df.index, plot_df["MACD"], color="#2962ff", linewidth=1.2)
-        ax_macd.plot(plot_df.index, plot_df["MACD_SIGNAL"], color="#ff9800", linewidth=1.2)
-        ax_macd.axhline(0, color="#787b86", linestyle="--", linewidth=0.8)
-        ax_macd.set_ylabel("MACD", color="#b2b5be", fontsize=8)
-        if div_info and div_info.get("macd_div"):
-            m_d = div_info["macd_div"]
-            ax_macd.plot([m_d["x1"], m_d["x2"]], [m_d["v1"], m_d["v2"]], color=m_d["color"], linewidth=2.0, marker="o", markersize=3, zorder=6)
+        mode_prefix = "INSTANT MARKET EXECUTION" if is_market else ("BUY SETUP" if strat_res["is_long"] else "SELL SETUP")
+        ax.set_title(
+            f"{asset_title}  |  {mode_prefix}  |  Score: {strat_res['confidence']}% ({strat_res['aligned_count']}/10)",
+            color="#ffffff", fontsize=10.2, fontweight="bold", pad=12
+        )
 
-        ax.set_title(f"{asset_title} | Entry: {e_mid} | Targets: +${u1} / +${u2} / +${u3} (Lot: {lot_size})", color="#ffffff", fontsize=9.5, fontweight="bold", pad=10)
-        for a in [ax, ax_rsi, ax_macd]:
-            a.grid(color="#2a2e39", linestyle="--", linewidth=0.5, alpha=0.6)
-            a.tick_params(colors="#b2b5be", labelsize=7.5)
-            for spine in a.spines.values():
-                spine.set_color("#2a2e39")
+        ax.grid(color="#2a2e39", linestyle="--", linewidth=0.5, alpha=0.5)
+        ax.tick_params(colors="#b2b5be", labelsize=8)
+        for spine in ax.spines.values():
+            spine.set_color("#2a2e39")
 
         plt.tight_layout()
         buf = io.BytesIO()
@@ -956,13 +1033,13 @@ def generate_chart_image(df, zones, vp_data, div_info, bos_events, asset_title, 
         plt.close("all")
         return None
 
-# ==================== 7. تسجيل الصفقات بخصوصية تامة لكل مستخدم (owner_id) ====================
-def register_private_trade(owner_chat_id, asset_name, sym_type, is_long, entry_zone, sl, exit_targets, usd_targets, tf_label):
+# ==================== 8. تسجيل الصفقة (المعلقة أو المباشرة بالسعر الحالي Market) ====================
+def register_private_trade(owner_chat_id, asset_name, sym_type, is_long, entry_zone, sl, exit_targets, usd_targets, tf_label, is_market=False):
     owner_id = str(owner_chat_id).strip()
     trade_key = f"{owner_id}_{sym_type}_{tf_label}"
     with trades_lock:
         old = active_trades.get(trade_key)
-        already_sent = old.get("voice_alert_sent", False) if (old and abs(old["entry_low"] - float(entry_zone[0])) < 0.5) else False
+        already_sent = True if is_market else (old.get("voice_alert_sent", False) if (old and abs(old["entry_low"] - float(entry_zone[0])) < 0.5) else False)
         active_trades[trade_key] = {
             "owner_id": owner_id,
             "asset": asset_name,
@@ -979,7 +1056,7 @@ def register_private_trade(owner_chat_id, asset_name, sym_type, is_long, entry_z
             "tp2_usd": usd_targets[1],
             "tp3_usd": usd_targets[2],
             "sl_usd": usd_targets[3],
-            "status": "PENDING",
+            "status": "ACTIVE" if is_market else "PENDING",
             "voice_alert_sent": already_sent,
             "tp1_hit": False,
             "tp2_hit": False,
@@ -994,10 +1071,10 @@ def analyze_and_send_zones(sym_type, ltf_str, chat_id):
     htf_use = HTF_MAP.get(ltf_use, "4h")
 
     if sym_type == "GOLD":
-        asset_name, chart_code = "XAU/USD (الذهب)", "XAU/USD"
+        asset_name, chart_code = "الذهب XAU/USD", "XAU/USD"
         ltf_df, htf_df = get_gold_ohlcv(ltf_use), get_gold_ohlcv(htf_use)
     else:
-        asset_name, chart_code = "BTC/USDT (البيتكوين)", "BTC/USDT"
+        asset_name, chart_code = "البيتكوين BTC/USDT", "BTC/USDT"
         ltf_df, htf_df = get_btc_ohlcv(ltf_use), get_btc_ohlcv(htf_use)
 
     if ltf_df.empty or len(ltf_df) < 35:
@@ -1013,36 +1090,30 @@ def analyze_and_send_zones(sym_type, ltf_str, chat_id):
     bos_events = detect_bos_choch(plot_slice)
     vp_data = calculate_volume_profile(ltf, num_bins=24)
 
-    strat_matrix = evaluate_multi_strategies(ltf, htf, div_info, bos_events, vp_data)
-    is_long = strat_matrix["is_long"]
+    strat_res = evaluate_10_strategies_clean(ltf, htf, div_info, bos_events, vp_data)
+    is_long = strat_res["is_long"]
 
     zones = analyze_structure_and_ote(ltf, is_long, sym_type, vp_data, u_prefs)
     entry_zone = zones["sniper_zone"]
+    entry_mid = zones["sniper_mid"]
 
-    l_curr = ltf.iloc[-1]
-    curr_price = round(float(l_curr["close"]), 2)
-
+    curr_price = round(float(ltf["close"].iloc[-1]), 2)
     lot = u_prefs["lot_size"]
-    u_tp1 = u_prefs["tp1_usd"]
-    u_tp2 = u_prefs["tp2_usd"]
-    u_tp3 = u_prefs["tp3_usd"]
-    u_sl = u_prefs["sl_usd"]
+    u_tp1, u_tp2, u_tp3, u_sl = u_prefs["tp1_usd"], u_prefs["tp2_usd"], u_prefs["tp3_usd"], u_prefs["sl_usd"]
 
     dist_tp1 = usd_to_price_distance(sym_type, u_tp1, lot)
     dist_tp2 = usd_to_price_distance(sym_type, u_tp2, lot)
     dist_tp3 = usd_to_price_distance(sym_type, u_tp3, lot)
     dist_sl = usd_to_price_distance(sym_type, u_sl, lot)
 
-    entry_mid = round((entry_zone[0] + entry_zone[1]) / 2, 2)
-
     if is_long:
-        dir_label = "شراء قريب (BUY LIMIT) 🟢"
+        dir_label = "🟢 شراء قريب (BUY LIMIT)"
         sl = round(entry_mid - dist_sl, 2)
         tp1 = round(entry_mid + dist_tp1, 2)
         tp2 = round(entry_mid + dist_tp2, 2)
         tp3 = round(entry_mid + dist_tp3, 2)
     else:
-        dir_label = "بيع قريب (SELL LIMIT) 🔴"
+        dir_label = "🔴 بيع قريب (SELL LIMIT)"
         sl = round(entry_mid + dist_sl, 2)
         tp1 = round(entry_mid - dist_tp1, 2)
         tp2 = round(entry_mid - dist_tp2, 2)
@@ -1051,38 +1122,118 @@ def analyze_and_send_zones(sym_type, ltf_str, chat_id):
     exit_targets = (tp1, tp2, tp3)
     usd_targets = (u_tp1, u_tp2, u_tp3, u_sl)
 
-    # حفظ الصفقة باسم هذا المستخدم فقط (cid)
-    register_private_trade(cid, asset_name, sym_type, is_long, entry_zone, sl, exit_targets, usd_targets, ltf_use)
+    register_private_trade(cid, asset_name, sym_type, is_long, entry_zone, sl, exit_targets, usd_targets, ltf_use, is_market=False)
 
-    style_name = "سكالبينج قريب ⚡" if u_prefs["profit_style"] == "scalp" else ("سوينق بعيد 🌊" if u_prefs["profit_style"] == "swing" else "مخصص ⚙️")
     in_zone_now = entry_zone[0] <= curr_price <= entry_zone[1]
-    prox_txt = "🔥 السعر داخل منطقة الدخول الآن!" if in_zone_now else f"⏳ تبعد `{zones['dist_from_curr']}$` فقط عن السعر الحالي"
+    prox_txt = "🔥 السعر داخل منطقة الدخول الآن!" if in_zone_now else f"تبعد `{zones['dist_from_curr']}$` فقط"
 
     caption = (
-        f"⚡ *تقرير القناص الخاص بك (Smart Proximity):*\n"
-        f"📊 *الأصل:* `{asset_name}` | *الفريم:* `{ltf_use}` (الأكبر `{htf_use}`)\n"
-        f"💵 *السعر الحالي:* `{curr_price}` | *التوافق:* `{strat_matrix['aligned_count']}/5` (`{strat_matrix['confidence']}%`)\n"
-        f"💼 *نمط الدخول والربح:* `{style_name}` | *اللوت:* `{lot}`\n"
+        f"🎯 *بطاقة الصفقة الذكية — {asset_name} ({ltf_use}):*\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"📋 *مصفوفة الاستراتيجيات الخمس:*\n"
-        f"1️⃣ *SMC + OTE:* {strat_matrix['s1_status']}\n"
-        f"2️⃣ *ICT Silver Bullet:* {strat_matrix['s2_status']}\n"
-        f"3️⃣ *Parabolic SAR + ADX:* {strat_matrix['s3_status']}\n"
-        f"4️⃣ *VWAP + BB Squeeze:* {strat_matrix['s4_status']}\n"
-        f"5️⃣ *Volume Profile POC:* {strat_matrix['s5_status']}\n"
-        f"🧬 *الدايفرجنس (RSI/MACD):* {div_info['text']}\n"
+        f"📌 *القرار:* *{dir_label}*\n"
+        f"💵 *السعر الحالي:* `{curr_price}` ({prox_txt})\n"
+        f"⭐ *قوة الصفقة:* `{strat_res['confidence']}%` ({strat_res['stars']} توافق `{strat_res['aligned_count']}/10`)\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"📌 *القرار الموحد:* {dir_label}\n"
-        f"🛡️ *سبب اختيار المنطقة:* `{zones['anchor_reason']}`\n"
-        f"📏 *قرب الصفقة:* {prox_txt}\n"
-        f"🎯 *منطقة الدخول القريبة:* `{entry_zone[0]}` إلى `{entry_zone[1]}` (المنتصف: `{entry_mid}`)\n"
-        f"🛑 *وقف الخسارة (SL = -${u_sl}):* `{sl}`\n"
-        f"✅ *الهدف الأول (TP1 = +${u_tp1}):* `{tp1}`\n"
-        f"🔥 *الهدف الثاني (TP2 = +${u_tp2}):* `{tp2}`\n"
-        f"🚀 *الهدف الثالث (TP3 = +${u_tp3}):* `{tp3}`"
+        f"📥 *منطقة الدخول:* `{entry_zone[0]}` — `{entry_zone[1]}` *(المنتصف: `{entry_mid}`)*\n"
+        f"🛑 *وقف الخسارة (-${u_sl}):* `{sl}`\n"
+        f"✅ *الهدف الأول (+${u_tp1}):* `{tp1}`\n"
+        f"🔥 *الهدف الثاني (+${u_tp2}):* `{tp2}`\n"
+        f"🚀 *الهدف الثالث (+${u_tp3}):* `{tp3}`\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"💡 *خلاصة التحليل:* {strat_res['summary_reasons']}\n"
+        f"🌍 *السيولة والدولار:* دلتا السيولة {strat_res['cvd_state']} | {strat_res['dxy_text']}\n"
+        f"👇 *للشراء أو البيع فوراً بالسعر الحالي اضغطي الزر الأول بالأسفل:*"
     )
-    chart_buf = generate_chart_image(ltf, zones, vp_data, div_info, bos_events, f"{chart_code} ({ltf_use})", entry_zone, sl, exit_targets, usd_targets, lot, is_long)
-    send_photo_msg(chart_buf, caption, sym_type, cid)
+
+    chart_buf = generate_clean_chart_image(
+        ltf, zones, vp_data, strat_res, f"{chart_code} ({ltf_use})", entry_zone, sl, exit_targets, usd_targets, is_market=False
+    )
+    send_photo_msg(chart_buf, caption, sym_type, cid, is_long=is_long)
+
+def execute_instant_market_trade(sym_type, mkt_dir, chat_id):
+    """حساب الأهداف والستوب فوراً من السعر اللحظي الحالي وتفعيل المراقبة الصوتية مباشرة"""
+    cid = str(chat_id).strip()
+    u_prefs = get_user_settings(cid)
+    ltf_use = u_prefs["ltf"]
+    htf_use = HTF_MAP.get(ltf_use, "4h")
+
+    if sym_type == "GOLD":
+        asset_name, chart_code = "الذهب XAU/USD", "XAU/USD"
+        ltf_df, htf_df = get_gold_ohlcv(ltf_use), get_gold_ohlcv(htf_use)
+    else:
+        asset_name, chart_code = "البيتكوين BTC/USDT", "BTC/USDT"
+        ltf_df, htf_df = get_btc_ohlcv(ltf_use), get_btc_ohlcv(htf_use)
+
+    if ltf_df.empty or len(ltf_df) < 35:
+        send_msg(f"⚠️ تعذر جلب السعر اللحظي لـ {asset_name}.", cid)
+        return
+    if htf_df.empty or len(htf_df) < 25:
+        htf_df = ltf_df
+
+    ltf = enrich_indicators(ltf_df)
+    htf = enrich_indicators(htf_df)
+    plot_slice = ltf.tail(55).reset_index(drop=True)
+    div_info = detect_rsi_macd_divergence(plot_slice)
+    bos_events = detect_bos_choch(plot_slice)
+    vp_data = calculate_volume_profile(ltf, num_bins=24)
+    strat_res = evaluate_10_strategies_clean(ltf, htf, div_info, bos_events, vp_data)
+
+    is_long = True if mkt_dir == "BUY" else (False if mkt_dir == "SELL" else strat_res["is_long"])
+    curr_price = round(float(ltf["close"].iloc[-1]), 2)
+
+    lot = u_prefs["lot_size"]
+    u_tp1, u_tp2, u_tp3, u_sl = u_prefs["tp1_usd"], u_prefs["tp2_usd"], u_prefs["tp3_usd"], u_prefs["sl_usd"]
+
+    dist_tp1 = usd_to_price_distance(sym_type, u_tp1, lot)
+    dist_tp2 = usd_to_price_distance(sym_type, u_tp2, lot)
+    dist_tp3 = usd_to_price_distance(sym_type, u_tp3, lot)
+    dist_sl = usd_to_price_distance(sym_type, u_sl, lot)
+
+    if is_long:
+        dir_label = "🟢 دخول شراء مباشر الآن (MARKET BUY)"
+        sl = round(curr_price - dist_sl, 2)
+        tp1 = round(curr_price + dist_tp1, 2)
+        tp2 = round(curr_price + dist_tp2, 2)
+        tp3 = round(curr_price + dist_tp3, 2)
+    else:
+        dir_label = "🔴 دخول بيع مباشر الآن (MARKET SELL)"
+        sl = round(curr_price + dist_sl, 2)
+        tp1 = round(curr_price - dist_tp1, 2)
+        tp2 = round(curr_price - dist_tp2, 2)
+        tp3 = round(curr_price - dist_tp3, 2)
+
+    exit_targets = (tp1, tp2, tp3)
+    usd_targets = (u_tp1, u_tp2, u_tp3, u_sl)
+    market_zone = (curr_price, curr_price)
+    zones = {
+        "sniper_mid": curr_price,
+        "sniper_zone": market_zone,
+        "anchor_reason": "تنفيذ مباشر بالسعر الحالي (Market Execution)",
+        "dist_from_curr": 0.0
+    }
+
+    # تسجيل الصفقة كصفقة مفعلة فوراً (ACTIVE) ليبدأ الرادار بمراقبة الأهداف مباشرة
+    register_private_trade(cid, asset_name, sym_type, is_long, market_zone, sl, exit_targets, usd_targets, ltf_use, is_market=True)
+
+    caption = (
+        f"⚡ *بطاقة تنفيذ مباشر بالسعر الحالي — {asset_name}:*\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📌 *النوع:* *{dir_label}*\n"
+        f"💵 *سعر الدخول الفوري:* `{curr_price}` *(مفعلة الآن 🔥)*\n"
+        f"📦 *حجم اللوت المحسوب:* `{lot}`\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🛑 *وقف الخسارة (-${u_sl}):* `{sl}`\n"
+        f"✅ *الهدف الأول (+${u_tp1}):* `{tp1}`\n"
+        f"🔥 *الهدف الثاني (+${u_tp2}):* `{tp2}`\n"
+        f"🚀 *الهدف الثالث (+${u_tp3}):* `{tp3}`\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🔊 *حالة الرادار:* تم تفعيل الصفقة في حسابكِ، وسينطق البوت صوتياً فور تحقيق كل هدف!"
+    )
+
+    chart_buf = generate_clean_chart_image(
+        ltf, zones, vp_data, strat_res, f"{chart_code} (MARKET {ltf_use})", market_zone, sl, exit_targets, usd_targets, is_market=True
+    )
+    send_photo_msg(chart_buf, caption, sym_type, cid, is_long=is_long)
 
 def get_latest_price_extremes(symbol_type):
     df = get_btc_ohlcv("1m", limit=3) if symbol_type == "BTC" else get_gold_ohlcv("5m")
@@ -1092,7 +1243,6 @@ def get_latest_price_extremes(symbol_type):
     return {"close": round(float(last["close"]), 2), "high": round(float(last["high"]), 2), "low": round(float(last["low"]), 2)}
 
 def trade_tracker_loop():
-    """متتبع الصفقات المعزول: يرسل إشعار الصفقة إلى صاحبها (owner_id) فقط"""
     while True:
         try:
             with trades_lock:
@@ -1209,21 +1359,20 @@ def trade_tracker_loop():
             print(f"Tracker error: {e}")
         time.sleep(TRACKER_INTERVAL)
 
-# ==================== 8. القوائم الخاصة بكل مستخدم ولوحة المشرف ====================
+# ==================== 9. القوائم الخاصة بكل مستخدم ولوحة المشرف ====================
 def send_compact_control_menu(chat_id):
     s = get_user_settings(chat_id)
     txt = (
         f"🎛️ *إعداداتك الخاصة والتحكم السريع:*\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"⏱ *الفريم الخاص بك:* `{s['ltf']}` (الأكبر `{s['htf']}`)\n"
+        f"⏱ *الفريم الحالي:* `{s['ltf']}`\n"
         f"💼 *نمط الربح:* `{s['profit_style'].upper()}` | *اللوت:* `{s['lot_size']}`\n"
         f"🎯 *أهدافك:* `+$ {s['tp1_usd']}` | `+$ {s['tp2_usd']}` | `+$ {s['tp3_usd']}` (SL: `-$ {s['sl_usd']}`)\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"💡 *أوامر التخصيص اليدوي لحسابك:*\n"
-        f"• لتغيير أهدافك: `/settp 5 10 20`\n"
+        f"💡 *أوامر التعديل اليدوي السريع:*\n"
+        f"• لتغيير الأهداف: `/settp 5 10 20`\n"
         f"• لتغيير الستوب: `/setsl 5`\n"
-        f"• لتغيير اللوت: `/setlot 0.01`\n"
-        f"👇 *اختر الإجراء المطلوب بضغطة واحدة:*"
+        f"• لتغيير اللوت: `/setlot 0.01`"
     )
     inline_menu = {
         "inline_keyboard": [
@@ -1288,7 +1437,7 @@ def approve_user_action(uid):
             "joined": time.strftime("%Y-%m-%d %H:%M", time.gmtime())
         }
         save_users_to_disk()
-    send_msg("🎉 *تمت موافقة المشرف على طلبك بنجاح!*\nجميع صفقاتك وإعداداتك وتنبيهاتك مستقلة وخاصة بك بالكامل.", uid)
+    send_msg("🎉 *تمت موافقة المشرف على طلبك بنجاح!*\nيمكنك الآن استخدام البوت بخصوصية كاملة من الأزرار بالأسفل:", uid)
     if ADMIN_CHAT_ID:
         send_msg(f"✅ *تم تفعيل المستخدم:* `{info.get('name')}` (`{uid}`) بنجاح.", ADMIN_CHAT_ID)
 
@@ -1311,12 +1460,12 @@ def format_user_trades_report(chat_id):
         user_trades = {k: v for k, v in active_trades.items() if v.get("owner_id") == cid}
     if not user_trades:
         return "📂 *لا توجد لديك صفقات نشطة حالياً.*\nاضغط على تحليل الذهب أو البيتكوين لبدء متابعة صفقتك الخاصة."
-    lines = ["📂 *صفقاتك الخاصة المراقبة تلقائياً (TP1 / TP2 / TP3):*\n━━━━━━━━━━━━━━━━━━"]
+    lines = ["📂 *صفقاتك الخاصة المراقبة تلقائياً:*\n━━━━━━━━━━━━━━━━━━"]
     for k, t in user_trades.items():
-        st = "⏳ بانتظار الملامسة" if t["status"] == "PENDING" else "🔥 مفعل بالسوق"
+        st = "⏳ بانتظار الملامسة" if t["status"] == "PENDING" else "🔥 مفعل بالسوق الآن"
         lines.append(
             f"🔹 *{t['asset']}* ({t['tf']}) | {st}\n"
-            f"   الدخول: `{t['entry_low']} - {t['entry_high']}` | SL: `{t['sl']}`\n"
+            f"   الدخول: `{t['entry_mid']}` | SL: `{t['sl']}`\n"
             f"   TP1 (+${t['tp1_usd']}): `{t['tp1']}` | TP2 (+${t['tp2_usd']}): `{t['tp2']}` | TP3 (+${t['tp3_usd']}): `{t['tp3']}`"
         )
     return "\n".join(lines)
@@ -1393,6 +1542,15 @@ def telegram_listener():
                                             send_msg(f"⏳ *طلب تفعيل معلق:*\nالاسم: `{u_info['name']}` (`@{u_info['username']}`)\nID: `{u_id}`", cb_chat, kb)
                                 continue
 
+                            # معالجة زر الدخول المباشر بالسعر الحالي (MKT|)
+                            if cb_data.startswith("MKT|"):
+                                if not is_user_authorized(cb_chat):
+                                    send_msg("🔒 غير مصرح لك باستخدام البوت.", cb_chat, remove_keyboard=True)
+                                    continue
+                                _, sym_t, mkt_dir = cb_data.split("|")
+                                execute_instant_market_trade(sym_t, mkt_dir, cb_chat)
+                                continue
+
                             if cb_data.startswith("MENU|"):
                                 if not is_user_authorized(cb_chat):
                                     send_msg("🔒 غير مصرح لك باستخدام البوت.", cb_chat, remove_keyboard=True)
@@ -1420,7 +1578,7 @@ def telegram_listener():
                                     analyze_and_send_zones("GOLD", u_s["ltf"], cb_chat)
                                     analyze_and_send_zones("BTC", u_s["ltf"], cb_chat)
                                 elif m_act == "TEST_VOICE":
-                                    test_speech = f"أهلاً بك، نظام التنبيهات الصوتية الخاص بحسابك يعمل بنجاح، والهدف الأول مضبوط على {int(u_s['tp1_usd'])} دولار."
+                                    test_speech = f"أهلاً بك، نظام الدخول المباشر والواجهة المبسطة يعملان بنجاح، والهدف الأول مضبوط على {int(u_s['tp1_usd'])} دولار."
                                     send_arabic_voice_alert(test_speech, "🗣️ *تجربة الناطق الصوتي الخاص بحسابك*", cb_chat)
                                 elif m_act == "CLEAR_TRADES":
                                     clear_user_trades(cb_chat)
@@ -1525,7 +1683,6 @@ def telegram_listener():
                                         send_msg("🔒 *هذا البوت خاص ومحمي بكلمة سر.*\n🔑 يرجى إرسال **كلمة السر الصحيحة** لطلب التفعيل:", chat_id, remove_keyboard=True)
                                 continue
 
-                        # أوامر المستخدم الخاصة (معزولة لكل مشترك)
                         u_s = get_user_settings(chat_id)
 
                         if text.startswith("/settp "):
@@ -1573,9 +1730,8 @@ def telegram_listener():
 
                         if text in ["/start", "/help"]:
                             send_msg(
-                                "🤖 *أهلاً بك في حسابك الخاص والمستقل!*\n"
-                                "• جميع صفقاتك وإعداداتك وتنبيهاتك خاصة بك وحدك.\n"
-                                "• اضغط على **`⚙️ الإعدادات والتحكم`** لضبط الفريم أو الأهداف.",
+                                "🤖 *أهلاً بك في الإصدار الاحترافي المبسط (10-in-1 + Market Execution)!*\n"
+                                "• يمكنك انتظار المنطقة القريبة أو الضغط على زر **`⚡ دخول مباشر بالسعر الحالي (Market)`** أسفل الشارت.",
                                 chat_id
                             )
                         elif text in ["⚙️ الإعدادات والتحكم", "⚙️ إعدادات الربح واللوت", "/settings"]:
@@ -1598,7 +1754,7 @@ def telegram_listener():
 
 @app.route("/")
 def home():
-    return "Multi-User Private Trading Bot is Live 24/7!"
+    return "10-Strategy + Instant Market Execution Bot is Live 24/7!"
 
 @app.route("/health")
 def health():
@@ -1632,9 +1788,8 @@ if __name__ == "__main__":
     threading.Thread(target=keep_alive_pinger, daemon=True).start()
     if ADMIN_CHAT_ID:
         send_msg(
-            "🛡️ *تم تفعيل نظام العزل والخصوصية الكاملة لكل مشترك بنجاح!*\n"
-            "• كل مستخدم أصبحت له صفقاته وإعداداته وتنبيهاته المستقلة تماماً.\n"
-            "• لن تصلكِ أي إشعارات من صفقات المشتركين بعد الآن، ويصلكِ فقط طلب التفعيل عند إدخال كلمة السر الصحيحة.",
+            "⚡ *تمت إضافة زر الدخول المباشر بالسعر الحالي (`Market Execution`) أسفل الشارت بنجاح!*\n"
+            "• عند الضغط عليه يحسب البوت فوراً `SL` و `TP1 / TP2 / TP3` من السعر اللحظي ويفعل الرادار الصوتي مباشرة.",
             ADMIN_CHAT_ID
         )
     port = int(os.environ.get("PORT", 10000))

@@ -35,6 +35,7 @@ active_trades = {}
 trades_lock = threading.Lock()
 
 dxy_cache = {"timestamp": 0, "bias": "NEUTRAL", "text": "مستقر"}
+spot_gold_cache = {"timestamp": 0, "price": None}
 
 # ==================== نظام الحفظ الدائم وعزل إعدادات كل مستخدم ====================
 USERS_FILE = "users_store.json"
@@ -77,7 +78,8 @@ def get_default_user_prefs():
         "tp1_usd": 5.0,
         "tp2_usd": 10.0,
         "tp3_usd": 20.0,
-        "sl_usd": 5.0
+        "sl_usd": 5.0,
+        "gold_offset": 0.0
     }
 
 def load_users_from_disk():
@@ -88,7 +90,8 @@ def load_users_from_disk():
         "user_prefs": {},
         "global_enabled": True,
         "password": BOT_PASSWORD,
-        "admin_email": ADMIN_EMAIL
+        "admin_email": ADMIN_EMAIL,
+        "global_gold_offset": 0.0
     }
     if os.path.exists(USERS_FILE):
         try:
@@ -101,6 +104,7 @@ def load_users_from_disk():
                 data["global_enabled"] = data.get("global_enabled", True)
                 data["password"] = data.get("password", BOT_PASSWORD)
                 data["admin_email"] = data.get("admin_email", ADMIN_EMAIL)
+                data["global_gold_offset"] = float(data.get("global_gold_offset", 0.0))
                 return data
         except Exception as e:
             print(f"Error loading users store: {e}")
@@ -116,7 +120,8 @@ def save_users_to_disk():
                 "user_prefs": users_db["user_prefs"],
                 "global_enabled": users_db["global_enabled"],
                 "password": users_db["password"],
-                "admin_email": users_db["admin_email"]
+                "admin_email": users_db["admin_email"],
+                "global_gold_offset": users_db.get("global_gold_offset", 0.0)
             }
             with open(USERS_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=4)
@@ -131,7 +136,10 @@ def get_user_settings(chat_id):
         if cid not in users_db["user_prefs"]:
             users_db["user_prefs"][cid] = get_default_user_prefs()
             save_users_to_disk()
-        return users_db["user_prefs"][cid]
+        prefs = users_db["user_prefs"][cid]
+        if "gold_offset" not in prefs:
+            prefs["gold_offset"] = 0.0
+        return prefs
 
 def apply_profit_profile(chat_id, profile_key):
     s = get_user_settings(chat_id)
@@ -228,7 +236,6 @@ def send_approval_email(user_id, full_name, username):
         return False, str(e)
 
 def get_inline_tf_buttons(sym_type):
-    """أزرار الشارت الشفافة مع زرين منفصلين بجانب بعضهما (شراء Market وبيع Market)"""
     return {
         "inline_keyboard": [
             [
@@ -345,7 +352,7 @@ def send_photo_msg(photo_buf, caption, sym_type, chat_id):
     except Exception:
         send_msg(caption, target, inline_kb)
 
-# ==================== 3. جلب البيانات + مؤشر الدولار DXY + المؤشرات العشر ====================
+# ==================== 3. جلب السعر الفوري الحقيقي للذهب (Real-Time Spot XAU/USD) ====================
 def clean_yf_dataframe(raw):
     if raw is None or raw.empty:
         return pd.DataFrame()
@@ -373,6 +380,55 @@ def clean_yf_dataframe(raw):
         if col not in raw.columns:
             raw[col] = 0.0
     return raw[needed].dropna(subset=["open", "high", "low", "close"])
+
+def get_raw_spot_gold_price():
+    """
+    جلب السعر الفوري الحي والحقيقي لأونصة الذهب (Spot XAU/USD) من عدة مصادر فورية عالمية
+    لتجنب فرق سعر العقود الآجلة (GC=F Futures)
+    """
+    now = time.time()
+    if spot_gold_cache["price"] is not None and (now - spot_gold_cache["timestamp"] < 8):
+        return spot_gold_cache["price"]
+
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+
+    # المصدر 1: واجهة Gold-API الفورية المباشرة (Spot XAU/USD)
+    try:
+        r1 = requests.get("https://api.gold-api.com/price/XAU", headers=headers, timeout=5)
+        if r1.ok:
+            p1 = float(r1.json().get("price", 0))
+            if p1 > 1000:
+                spot_gold_cache.update({"timestamp": now, "price": round(p1, 2)})
+                return spot_gold_cache["price"]
+    except Exception:
+        pass
+
+    # المصدر 2: بورصة التسعير الفوري العالمية GoldPrice.org (Spot XAU/USD)
+    try:
+        r2 = requests.get("https://data-asg.goldprice.org/dbXRates/USD", headers=headers, timeout=5)
+        if r2.ok:
+            items = r2.json().get("items", [])
+            if items:
+                p2 = float(items[0].get("xauPrice", 0))
+                if p2 > 1000:
+                    spot_gold_cache.update({"timestamp": now, "price": round(p2, 2)})
+                    return spot_gold_cache["price"]
+    except Exception:
+        pass
+
+    # المصدر 3: Swissquote / Yahoo Spot XAUUSD=X
+    try:
+        t_spot = yf.Ticker("XAUUSD=X")
+        hist = t_spot.history(period="1d", interval="1m")
+        if hist is not None and not hist.empty:
+            p3 = float(hist["Close"].dropna().iloc[-1])
+            if p3 > 1000:
+                spot_gold_cache.update({"timestamp": now, "price": round(p3, 2)})
+                return spot_gold_cache["price"]
+    except Exception:
+        pass
+
+    return spot_gold_cache["price"]
 
 def get_btc_ohlcv(timeframe, limit=220):
     for ex_name in ["kucoin", "kraken", "bybit", "binance"]:
@@ -413,12 +469,44 @@ def get_yf_asset_ohlcv(ticker_sym, timeframe):
         pass
     return pd.DataFrame()
 
-def get_gold_ohlcv(timeframe):
+def get_gold_ohlcv(timeframe, user_offset=0.0):
+    """
+    جلب شموع الذهب الغنية بالفوليوم ثم معايرتها تلقائياً لتطابق السعر الفوري الحقيقي (Spot XAU/USD)
+    مع إضافة أي معايرة خاصة بمنصة المستخدم (user_offset)
+    """
+    df = pd.DataFrame()
     for sym in ["GC=F", "XAUUSD=X"]:
         df = get_yf_asset_ohlcv(sym, timeframe)
         if not df.empty and len(df) > 35:
-            return df
-    return pd.DataFrame()
+            break
+
+    if df.empty:
+        return df
+
+    df = df.copy()
+    for col in ["open", "high", "low", "close"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
+
+    # معايرة الشموع من سعر الفيوتشر إلى السعر الفوري الحقيقي (Spot XAU/USD)
+    spot_now = get_raw_spot_gold_price()
+    last_candle_close = float(df["close"].iloc[-1])
+
+    total_shift = 0.0
+    if spot_now is not None and spot_now > 1000:
+        basis_diff = spot_now - last_candle_close
+        # إذا كان هناك فرق بين الفيوتشر والفوري نعدله تلقائياً
+        if abs(basis_diff) <= 150.0:
+            total_shift += basis_diff
+
+    # إضافة معايرة البروكر الخاصة بالمستخدم أو المشرف إن وجدت
+    total_shift += float(user_offset)
+
+    if abs(total_shift) > 0.001:
+        for col in ["open", "high", "low", "close"]:
+            df[col] = (df[col] + total_shift).round(2)
+
+    return df
 
 def get_dxy_correlation_bias():
     now = time.time()
@@ -1012,8 +1100,8 @@ def generate_clean_chart_image(df, zones, vp_data, strat_res, asset_title, entry
 
         mode_prefix = "INSTANT MARKET EXECUTION" if is_market else ("BUY SETUP" if strat_res["is_long"] else "SELL SETUP")
         ax.set_title(
-            f"{asset_title}  |  {mode_prefix}  |  Score: {strat_res['confidence']}% ({strat_res['aligned_count']}/10)",
-            color="#ffffff", fontsize=10.2, fontweight="bold", pad=12
+            f"{asset_title} [REAL SPOT]  |  {mode_prefix}  |  Score: {strat_res['confidence']}% ({strat_res['aligned_count']}/10)",
+            color="#ffffff", fontsize=10.0, fontweight="bold", pad=12
         )
 
         ax.grid(color="#2a2e39", linestyle="--", linewidth=0.5, alpha=0.5)
@@ -1032,8 +1120,8 @@ def generate_clean_chart_image(df, zones, vp_data, strat_res, asset_title, entry
         plt.close("all")
         return None
 
-# ==================== 8. تسجيل الصفقة (المعلقة أو المباشرة بالسعر الحالي Market) ====================
-def register_private_trade(owner_chat_id, asset_name, sym_type, is_long, entry_zone, sl, exit_targets, usd_targets, tf_label, is_market=False):
+# ==================== 8. تسجيل الصفقة (المعلقة أو المباشرة بالسعر الفوري الحقيقي) ====================
+def register_private_trade(owner_chat_id, asset_name, sym_type, is_long, entry_zone, sl, exit_targets, usd_targets, tf_label, gold_offset=0.0, is_market=False):
     owner_id = str(owner_chat_id).strip()
     trade_key = f"{owner_id}_{sym_type}_{tf_label}"
     with trades_lock:
@@ -1055,6 +1143,7 @@ def register_private_trade(owner_chat_id, asset_name, sym_type, is_long, entry_z
             "tp2_usd": usd_targets[1],
             "tp3_usd": usd_targets[2],
             "sl_usd": usd_targets[3],
+            "gold_offset": float(gold_offset),
             "status": "ACTIVE" if is_market else "PENDING",
             "voice_alert_sent": already_sent,
             "tp1_hit": False,
@@ -1068,10 +1157,12 @@ def analyze_and_send_zones(sym_type, ltf_str, chat_id):
     u_prefs = get_user_settings(cid)
     ltf_use = ltf_str or u_prefs["ltf"]
     htf_use = HTF_MAP.get(ltf_use, "4h")
+    user_offset = float(u_prefs.get("gold_offset", 0.0))
 
     if sym_type == "GOLD":
-        asset_name, chart_code = "الذهب XAU/USD", "XAU/USD"
-        ltf_df, htf_df = get_gold_ohlcv(ltf_use), get_gold_ohlcv(htf_use)
+        asset_name, chart_code = "الذهب الفوري XAU/USD", "XAU/USD"
+        ltf_df = get_gold_ohlcv(ltf_use, user_offset)
+        htf_df = get_gold_ohlcv(htf_use, user_offset)
     else:
         asset_name, chart_code = "البيتكوين BTC/USDT", "BTC/USDT"
         ltf_df, htf_df = get_btc_ohlcv(ltf_use), get_btc_ohlcv(htf_use)
@@ -1121,7 +1212,7 @@ def analyze_and_send_zones(sym_type, ltf_str, chat_id):
     exit_targets = (tp1, tp2, tp3)
     usd_targets = (u_tp1, u_tp2, u_tp3, u_sl)
 
-    register_private_trade(cid, asset_name, sym_type, is_long, entry_zone, sl, exit_targets, usd_targets, ltf_use, is_market=False)
+    register_private_trade(cid, asset_name, sym_type, is_long, entry_zone, sl, exit_targets, usd_targets, ltf_use, gold_offset=user_offset, is_market=False)
 
     in_zone_now = entry_zone[0] <= curr_price <= entry_zone[1]
     prox_txt = "🔥 السعر داخل منطقة الدخول الآن!" if in_zone_now else f"تبعد `{zones['dist_from_curr']}$` فقط"
@@ -1130,7 +1221,7 @@ def analyze_and_send_zones(sym_type, ltf_str, chat_id):
         f"🎯 *بطاقة الصفقة الذكية — {asset_name} ({ltf_use}):*\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📌 *القرار المقترح:* *{dir_label}*\n"
-        f"💵 *السعر الحالي:* `{curr_price}` ({prox_txt})\n"
+        f"💵 *السعر الفوري الحقيقي:* `{curr_price}` ({prox_txt})\n"
         f"⭐ *قوة الصفقة:* `{strat_res['confidence']}%` ({strat_res['stars']} توافق `{strat_res['aligned_count']}/10`)\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📥 *منطقة الدخول:* `{entry_zone[0]}` — `{entry_zone[1]}` *(المنتصف: `{entry_mid}`)*\n"
@@ -1150,15 +1241,16 @@ def analyze_and_send_zones(sym_type, ltf_str, chat_id):
     send_photo_msg(chart_buf, caption, sym_type, cid)
 
 def execute_instant_market_trade(sym_type, mkt_dir, chat_id):
-    """حساب الأهداف والستوب فوراً من السعر اللحظي الحالي حسب الزر المضغوط (BUY أو SELL)"""
     cid = str(chat_id).strip()
     u_prefs = get_user_settings(cid)
     ltf_use = u_prefs["ltf"]
     htf_use = HTF_MAP.get(ltf_use, "4h")
+    user_offset = float(u_prefs.get("gold_offset", 0.0))
 
     if sym_type == "GOLD":
-        asset_name, chart_code = "الذهب XAU/USD", "XAU/USD"
-        ltf_df, htf_df = get_gold_ohlcv(ltf_use), get_gold_ohlcv(htf_use)
+        asset_name, chart_code = "الذهب الفوري XAU/USD", "XAU/USD"
+        ltf_df = get_gold_ohlcv(ltf_use, user_offset)
+        htf_df = get_gold_ohlcv(htf_use, user_offset)
     else:
         asset_name, chart_code = "البيتكوين BTC/USDT", "BTC/USDT"
         ltf_df, htf_df = get_btc_ohlcv(ltf_use), get_btc_ohlcv(htf_use)
@@ -1208,14 +1300,14 @@ def execute_instant_market_trade(sym_type, mkt_dir, chat_id):
     zones = {
         "sniper_mid": curr_price,
         "sniper_zone": market_zone,
-        "anchor_reason": "تنفيذ مباشر بالسعر الحالي (Market Execution)",
+        "anchor_reason": "تنفيذ مباشر بالسعر الفوري الحقيقي (Market Execution)",
         "dist_from_curr": 0.0
     }
 
-    register_private_trade(cid, asset_name, sym_type, is_long, market_zone, sl, exit_targets, usd_targets, ltf_use, is_market=True)
+    register_private_trade(cid, asset_name, sym_type, is_long, market_zone, sl, exit_targets, usd_targets, ltf_use, gold_offset=user_offset, is_market=True)
 
     caption = (
-        f"⚡ *بطاقة تنفيذ فوري بالسعر الحالي — {asset_name}:*\n"
+        f"⚡ *بطاقة تنفيذ فوري بالسعر الفوري الحقيقي — {asset_name}:*\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📌 *النوع:* *{dir_label}*\n"
         f"💵 *سعر الدخول الفوري:* `{curr_price}` *(مفعلة الآن 🔥)*\n"
@@ -1234,8 +1326,8 @@ def execute_instant_market_trade(sym_type, mkt_dir, chat_id):
     )
     send_photo_msg(chart_buf, caption, sym_type, cid)
 
-def get_latest_price_extremes(symbol_type):
-    df = get_btc_ohlcv("1m", limit=3) if symbol_type == "BTC" else get_gold_ohlcv("5m")
+def get_latest_price_extremes(symbol_type, gold_offset=0.0):
+    df = get_btc_ohlcv("1m", limit=3) if symbol_type == "BTC" else get_gold_ohlcv("5m", gold_offset)
     if df.empty:
         return None
     last = df.iloc[-1]
@@ -1247,7 +1339,6 @@ def trade_tracker_loop():
             with trades_lock:
                 keys = list(active_trades.keys())
             if keys:
-                cache = {}
                 for k in keys:
                     with trades_lock:
                         t = active_trades.get(k)
@@ -1261,9 +1352,8 @@ def trade_tracker_loop():
                         continue
 
                     sym = t["symbol_type"]
-                    if sym not in cache:
-                        cache[sym] = get_latest_price_extremes(sym)
-                    p = cache[sym]
+                    g_off = float(t.get("gold_offset", 0.0))
+                    p = get_latest_price_extremes(sym, g_off)
                     if not p:
                         continue
                     high_p, low_p, curr_p = p["high"], p["low"], p["close"]
@@ -1276,7 +1366,7 @@ def trade_tracker_loop():
                                 if k in active_trades:
                                     active_trades[k]["voice_alert_sent"] = True
                             speech_txt = f"تنبيه هام. وصل سعر {arabic_name} الآن إلى منطقة الدخول القريبة عند مستوى {int(curr_p)} لصفقة {dir_word}."
-                            caption_txt = f"🗣️ *تنبيه خاص بصفقتك: وصل سعر {arabic_name} إلى منطقة الدخول!*\n🎯 المنطقة: `{t['entry_low']} - {t['entry_high']}` | السعر: `{curr_p}`"
+                            caption_txt = f"🗣️ *تنبيه خاص بصفقتك: وصل سعر {arabic_name} إلى منطقة الدخول!*\n🎯 المنطقة: `{t['entry_low']} - {t['entry_high']}` | السعر الفوري: `{curr_p}`"
                             send_arabic_voice_alert(speech_txt, caption_txt, owner_id)
 
                     if t["status"] == "PENDING":
@@ -1361,16 +1451,21 @@ def trade_tracker_loop():
 # ==================== 9. القوائم الخاصة بكل مستخدم ولوحة المشرف ====================
 def send_compact_control_menu(chat_id):
     s = get_user_settings(chat_id)
+    spot_now = get_raw_spot_gold_price()
+    cal_price = round((spot_now or 0.0) + float(s.get("gold_offset", 0.0)), 2) if spot_now else "تلقائي"
     txt = (
         f"🎛️ *إعداداتك الخاصة والتحكم السريع:*\n"
         f"━━━━━━━━━━━━━━━━━━\n"
+        f"🪙 *سعر الذهب الفوري المعتمد:* `{cal_price}` (المعايرة: `{s.get('gold_offset', 0.0):+}`)\n"
         f"⏱ *الفريم الحالي:* `{s['ltf']}`\n"
         f"💼 *نمط الربح:* `{s['profit_style'].upper()}` | *اللوت:* `{s['lot_size']}`\n"
         f"🎯 *أهدافك:* `+$ {s['tp1_usd']}` | `+$ {s['tp2_usd']}` | `+$ {s['tp3_usd']}` (SL: `-$ {s['sl_usd']}`)\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"💡 *أوامر التعديل اليدوي السريع:*\n"
-        f"• لتغيير الأهداف: `/settp 5 10 20`\n"
-        f"• لتغيير الستوب: `/setsl 5`\n"
+        f"• لمطابقة سعر الذهب مع منصتك بالضبط أرسل:\n"
+        f"`/sync 2745.50` *(ضع السعر الظاهر أمامك في MT5)*\n"
+        f"• لإعادة سعر الذهب للوضع الفوري التلقائي: `/sync 0`\n"
+        f"• لتغيير الأهداف: `/settp 5 10 20` | الستوب: `/setsl 5`\n"
         f"• لتغيير اللوت: `/setlot 0.01`"
     )
     inline_menu = {
@@ -1542,7 +1637,6 @@ def telegram_listener():
                                             send_msg(f"⏳ *طلب تفعيل معلق:*\nالاسم: `{u_info['name']}` (`@{u_info['username']}`)\nID: `{u_id}`", cb_chat, kb)
                                 continue
 
-                            # معالجة زري الشراء والبيع الفوري بالسعر الحالي (MKT|...|BUY أو MKT|...|SELL)
                             if cb_data.startswith("MKT|"):
                                 if not is_user_authorized(cb_chat):
                                     send_msg("🔒 غير مصرح لك باستخدام البوت.", cb_chat, remove_keyboard=True)
@@ -1578,7 +1672,7 @@ def telegram_listener():
                                     analyze_and_send_zones("GOLD", u_s["ltf"], cb_chat)
                                     analyze_and_send_zones("BTC", u_s["ltf"], cb_chat)
                                 elif m_act == "TEST_VOICE":
-                                    test_speech = f"أهلاً بك، أزرار الشراء والبيع الفوري بالسعر الحالي تعمل بنجاح، والهدف الأول مضبوط على {int(u_s['tp1_usd'])} دولار."
+                                    test_speech = f"أهلاً بك، تم ربط البوت بالسعر الفوري الحقيقي للذهب بنجاح، والهدف الأول مضبوط على {int(u_s['tp1_usd'])} دولار."
                                     send_arabic_voice_alert(test_speech, "🗣️ *تجربة الناطق الصوتي الخاص بحسابك*", cb_chat)
                                 elif m_act == "CLEAR_TRADES":
                                     clear_user_trades(cb_chat)
@@ -1685,6 +1779,34 @@ def telegram_listener():
 
                         u_s = get_user_settings(chat_id)
 
+                        # أمر معايرة سعر الذهب مع منصة المستخدم (/sync 2745.50 أو /sync 0)
+                        if text.startswith("/sync "):
+                            try:
+                                val = float(text.replace("/sync ", "").strip())
+                                if val == 0:
+                                    with users_lock:
+                                        u_s["gold_offset"] = 0.0
+                                        save_users_to_disk()
+                                    spot_p = get_raw_spot_gold_price()
+                                    send_msg(f"✅ *تمت إعادة تسعير الذهب إلى السعر الفوري العالمي التلقائي:* `{spot_p}`", chat_id)
+                                elif val > 1000:
+                                    spot_p = get_raw_spot_gold_price()
+                                    if spot_p is None:
+                                        df_tmp = get_gold_ohlcv("5m", 0.0)
+                                        spot_p = float(df_tmp["close"].iloc[-1]) if not df_tmp.empty else val
+                                    diff = round(val - spot_p, 2)
+                                    with users_lock:
+                                        u_s["gold_offset"] = diff
+                                        save_users_to_disk()
+                                    send_msg(
+                                        f"🎯 *تمت مطابقة سعر الذهب مع منصتك في MT5 بنجاح!*\n"
+                                        f"• السعر المعتمد الآن: `{val}` (فارق المعايرة: `{diff:+}` دولار).",
+                                        chat_id
+                                    )
+                            except Exception:
+                                send_msg("⚠️ أرسل السعر الحالي في منصتك هكذا: `/sync 2745.50` أو أرسل `/sync 0` للوضع التلقائي.", chat_id)
+                            continue
+
                         if text.startswith("/settp "):
                             try:
                                 nums = [float(x) for x in text.replace("/settp ", "").split() if x.strip()]
@@ -1730,8 +1852,8 @@ def telegram_listener():
 
                         if text in ["/start", "/help"]:
                             send_msg(
-                                "🤖 *أهلاً بك في الإصدار الاحترافي المبسط (10-in-1 + Market Buy/Sell)!*\n"
-                                "• ستجدين أسفل كل شارت زرين منفصلين: **`🟢 شراء فوري (Market Buy)`** و **`🔴 بيع فوري (Market Sell)`** لحساب الأهداف فوراً من السعر الحالي.",
+                                "🤖 *أهلاً بك في الإصدار المحدث بالسعر الفوري الحقيقي للذهب (Real-Time Spot XAU/USD)!*\n"
+                                "• يطابق البوت الآن سعر أونصة الذهب الفوري تلقائياً، ويمكنكِ أيضاً كتابة `/sync` متبوعاً بسعر منصتكِ لمطابقته بالمللي.",
                                 chat_id
                             )
                         elif text in ["⚙️ الإعدادات والتحكم", "⚙️ إعدادات الربح واللوت", "/settings"]:
@@ -1754,7 +1876,7 @@ def telegram_listener():
 
 @app.route("/")
 def home():
-    return "10-Strategy + Dual Market Buy/Sell Bot is Live 24/7!"
+    return "Real-Time Spot XAU/USD + 10-Strategy Bot is Live 24/7!"
 
 @app.route("/health")
 def health():
@@ -1787,8 +1909,10 @@ if __name__ == "__main__":
     threading.Thread(target=trade_tracker_loop, daemon=True).start()
     threading.Thread(target=keep_alive_pinger, daemon=True).start()
     if ADMIN_CHAT_ID:
+        spot_init = get_raw_spot_gold_price()
         send_msg(
-            "✅ *تمت إضافة زري الشراء الفوري والبيع الفوري (`🟢 Market Buy` | `🔴 Market Sell`) جنباً إلى جنب أسفل الشارت!*",
+            f"🪙 *تم حل مشكلة فرق سعر الذهب وربط البوت بالسعر الفوري العالمي الحقيقي (`Spot XAU/USD: {spot_init}`) بنجاح!*\n"
+            "• لمطابقة السعر مع منصتكِ في MT5 بالمللي إذا كان هناك فرق سبريد، أرسلي `/sync` متبوعاً بالسعر الظاهر أمامك.",
             ADMIN_CHAT_ID
         )
     port = int(os.environ.get("PORT", 10000))
